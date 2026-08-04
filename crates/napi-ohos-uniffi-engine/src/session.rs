@@ -27,12 +27,6 @@ pub enum SessionCallbackThreading {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SessionCallbackCallStyle {
-  Sync,
-  Async,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionCallbackErrorStyle {
   Infallible,
   Fallible,
@@ -50,8 +44,6 @@ pub struct SessionCallbackArgument {
   pub callback_type_id: u32,
   pub retention: SessionCallbackRetention,
   pub threading: SessionCallbackThreading,
-  pub call_style: SessionCallbackCallStyle,
-  pub error_style: SessionCallbackErrorStyle,
   pub reentrancy: SessionCallbackReentrancy,
 }
 
@@ -80,10 +72,12 @@ pub enum SessionOperationDispatch {
   CallbackHostSync {
     callback_type_id: u32,
     method_id: u32,
+    error_style: SessionCallbackErrorStyle,
   },
   CallbackHostAsync {
     callback_type_id: u32,
     method_id: u32,
+    error_style: SessionCallbackErrorStyle,
   },
   InputStreamHostPull,
   InputStreamHostCancel,
@@ -134,21 +128,6 @@ pub(crate) fn callback_reentrancy_for_operation(
     .unwrap_or(SessionCallbackReentrancy::Allowed)
 }
 
-#[cfg(test)]
-pub(crate) fn callback_reentrancy_for_registry(
-  registry: &BTreeMap<CallbackKey, SessionCallbackArgument>,
-  callback_type_id: u32,
-  callback_id: u32,
-) -> SessionCallbackReentrancy {
-  registry
-    .get(&CallbackKey {
-      callback_type_id,
-      callback_id,
-    })
-    .map(|argument| argument.reentrancy)
-    .unwrap_or(SessionCallbackReentrancy::Allowed)
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct CallbackKey {
   pub(crate) callback_type_id: u32,
@@ -190,6 +169,7 @@ struct SessionState {
   proxy_host: Cell<sys::napi_ref>,
   session_weak: Cell<sys::napi_ref>,
   operations: Vec<SessionOperation>,
+  callback_methods: BTreeMap<(u32, u32), SessionCallbackErrorStyle>,
   closed: Cell<bool>,
   next_invocation_id: Cell<u32>,
   next_callback_registration_id: Cell<u64>,
@@ -359,6 +339,23 @@ impl SessionState {
         format!("unknown UniFFI operation ID {id}"),
       )
     })
+  }
+
+  fn callback_method_error_style(
+    &self,
+    callback_type_id: u32,
+    method_id: u32,
+  ) -> Result<SessionCallbackErrorStyle> {
+    self
+      .callback_methods
+      .get(&(callback_type_id, method_id))
+      .copied()
+      .ok_or_else(|| {
+        Error::new(
+          Status::InvalidArg,
+          format!("unknown callback method {callback_type_id}:{method_id}"),
+        )
+      })
   }
 
   fn retain_inputs_and_receiver(
@@ -611,9 +608,11 @@ impl SessionState {
       SessionOperationDispatch::CallbackHostSync {
         callback_type_id,
         method_id,
+        error_style,
       } => self.dispatch_callback_host(
         callback_type_id,
         method_id,
+        error_style,
         args,
         false,
         &operation.callback_arguments,
@@ -622,9 +621,11 @@ impl SessionState {
       SessionOperationDispatch::CallbackHostAsync {
         callback_type_id,
         method_id,
+        error_style,
       } => self.dispatch_callback_host(
         callback_type_id,
         method_id,
+        error_style,
         args,
         true,
         &operation.callback_arguments,
@@ -753,6 +754,7 @@ impl SessionState {
     &self,
     callback_type_id: u32,
     method_id: u32,
+    error_style: SessionCallbackErrorStyle,
     args: Vec<sys::napi_value>,
     asynchronous: bool,
     callback_arguments: &[SessionCallbackArgument],
@@ -769,63 +771,27 @@ impl SessionState {
       callback_type_id,
       callback_id,
     };
-    let expected_style = if asynchronous {
-      SessionCallbackCallStyle::Async
-    } else {
-      SessionCallbackCallStyle::Sync
-    };
     let registered = self
       .callback_contracts
       .borrow()
       .get(&key)
       .cloned()
       .unwrap_or_default();
-    let contract = registered
-      .iter()
-      .map(|registered| registered.contract)
-      .find(|contract| contract.call_style == expected_style)
-      .or_else(|| {
-        callback_arguments
-          .iter()
-          .find(|argument| {
-            argument.callback_type_id == callback_type_id && argument.call_style == expected_style
-          })
-          .copied()
-      });
-    if !registered.is_empty() && contract.is_none() {
-      return Err(Error::new(
-        Status::InvalidArg,
-        format!(
-          "callback type {callback_type_id} method {method_id} has no active {} contract",
-          if asynchronous { "async" } else { "sync" },
-        ),
-      ));
-    }
     let operation_reentrancy =
       callback_reentrancy_for_operation(callback_arguments, callback_type_id);
     let guarded = operation_reentrancy == SessionCallbackReentrancy::Forbidden
       || registered
         .iter()
-        .any(|registered| registered.contract.reentrancy == SessionCallbackReentrancy::Forbidden)
-      || contract.is_some_and(|value| value.reentrancy == SessionCallbackReentrancy::Forbidden);
-    if let Some(contract) = contract {
-      let expected_async = contract.call_style == SessionCallbackCallStyle::Async;
-      if expected_async != asynchronous {
-        return Err(Error::new(
-          Status::InvalidArg,
-          format!(
-            "callback type {callback_type_id} method {method_id} is {}, but the operation is {}",
-            if expected_async { "async" } else { "sync" },
-            if asynchronous { "async" } else { "sync" },
-          ),
-        ));
-      }
-      if !asynchronous && contract.threading == SessionCallbackThreading::MayCrossThread {
-        return Err(Error::new(
-          Status::InvalidArg,
-          "synchronous callbacks cannot use the may-cross-thread policy",
-        ));
-      }
+        .any(|registered| registered.contract.reentrancy == SessionCallbackReentrancy::Forbidden);
+    if !asynchronous
+      && registered
+        .iter()
+        .any(|registered| registered.contract.threading == SessionCallbackThreading::MayCrossThread)
+    {
+      return Err(Error::new(
+        Status::InvalidArg,
+        "synchronous callbacks cannot use the may-cross-thread policy",
+      ));
     }
     if guarded && !self.active_callbacks.borrow_mut().insert(key) {
       return Err(Error::new(
@@ -837,7 +803,14 @@ impl SessionState {
       Ok(value) => value,
       Err(error) => {
         clear_callback_guard_on_error(&self.active_callbacks, guarded, key);
-        return Err(error);
+        return Err(if error_style == SessionCallbackErrorStyle::Infallible {
+          Error::new(
+            Status::GenericFailure,
+            format!("infallible callback method {method_id} failed: {error}"),
+          )
+        } else {
+          error
+        });
       }
     };
     let result = match (|| {
@@ -1425,12 +1398,29 @@ pub fn create_backend_session(
       stream_arguments: descriptor.stream_arguments,
     });
   }
+  let callback_methods = operations
+    .iter()
+    .filter_map(|operation| match operation.dispatch {
+      SessionOperationDispatch::CallbackHostSync {
+        callback_type_id,
+        method_id,
+        error_style,
+      }
+      | SessionOperationDispatch::CallbackHostAsync {
+        callback_type_id,
+        method_id,
+        error_style,
+      } => Some(((callback_type_id, method_id), error_style)),
+      _ => None,
+    })
+    .collect();
   let state = Box::new(SessionState {
     env: env.raw(),
     host: Cell::new(host_reference),
     proxy_host: Cell::new(ptr::null_mut()),
     session_weak: Cell::new(ptr::null_mut()),
     operations,
+    callback_methods,
     closed: Cell::new(false),
     next_invocation_id: Cell::new(0),
     next_callback_registration_id: Cell::new(0),
@@ -1565,11 +1555,13 @@ unsafe extern "C" fn proxy_invoke_callback_sync(
     state.ensure_open()?;
     let callback_type_id = value_u32(env, args[0], "callback type ID")?;
     let method_id = value_u32(env, args[2], "callback method ID")?;
+    let error_style = state.callback_method_error_style(callback_type_id, method_id)?;
     let mut callback_args = vec![args[1]];
     callback_args.extend(array_values(env, args[3])?);
     state.dispatch_callback_host(
       callback_type_id,
       method_id,
+      error_style,
       callback_args,
       false,
       &[],
@@ -1587,11 +1579,13 @@ unsafe extern "C" fn proxy_invoke_callback_async(
     state.ensure_open()?;
     let callback_type_id = value_u32(env, args[0], "callback type ID")?;
     let method_id = value_u32(env, args[2], "callback method ID")?;
+    let error_style = state.callback_method_error_style(callback_type_id, method_id)?;
     let mut callback_args = vec![args[1]];
     callback_args.extend(array_values(env, args[4])?);
     state.dispatch_callback_host(
       callback_type_id,
       method_id,
+      error_style,
       callback_args,
       true,
       &[],
@@ -2109,8 +2103,6 @@ mod tests {
       callback_type_id: 5,
       retention: SessionCallbackRetention::Scoped,
       threading: SessionCallbackThreading::CallingThread,
-      call_style: SessionCallbackCallStyle::Sync,
-      error_style: SessionCallbackErrorStyle::Infallible,
       reentrancy: SessionCallbackReentrancy::Forbidden,
     };
     let mut registry = BTreeMap::from([(

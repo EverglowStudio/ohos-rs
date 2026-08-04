@@ -46,6 +46,9 @@ const host = {
   handle: 88,
   invokeCallbackSync(typeId, callbackId, methodId, args) {
     callbackCalls.push(['sync', typeId, callbackId, methodId, args]);
+    if (methodId === 3 && args[0] === 88) {
+      throw new Error('fixture infallible sync callback failed');
+    }
     if (args[0] === 99) {
       assert.throws(
         () => session.invokeSync(9, [callbackId, 99]),
@@ -119,13 +122,13 @@ assert.equal(session.invokeSync(4, [9]).error.domain, 'declared');
 const object = { handle: 77 };
   assert.equal(session.invokeSync(5, [object]).value, object);
   session.releaseObject(object);
-  assert.equal(session.invokeSync(6, [10]).value, 7);
+  assert.equal(session.invokeSync(6, [10]).value, 15);
 
 (async () => {
   assert.equal((await session.invokeAsync(1, [6])).value, 7);
   // The native async proxy is backed by a real TSFN.  Its call is queued from
   // the Tokio worker and reaches Host.invokeCallbackAsync on the JS thread.
-  assert.equal((await session.invokeAsync(7, [20])).value, 15);
+  assert.equal((await session.invokeAsync(7, [20])).value, 31);
   assert.equal(await session.invokeAsync(8, [20, 5]), 15);
   assert.equal(await session.invokeAsync(8, [20, 6]), 16);
   await assert.rejects(
@@ -147,18 +150,27 @@ const object = { handle: 77 };
   assert.equal(callbackCalls.length, callbackCountAfterTrap);
   await savedFinally();
   assert.equal(await session.invokeAsync(8, [20, 78]), 88);
-  assert.equal(session.invokeSync(9, [10, 99]), 101);
+  assert.equal(await session.invokeAsync(10, [20, 6]), 16);
+  await assert.rejects(
+    session.invokeAsync(10, [20, 42]),
+    /fixture async callback rejected/,
+  );
+  assert.equal(session.invokeSync(11, [10, 99]), 101);
+  assert.throws(
+    () => session.invokeSync(11, [10, 88]),
+    /fixture infallible sync callback failed/,
+  );
 
-  assert.equal((await session.invokeAsync(13, [9])).value, 10);
-  assert.deepEqual(await session.invokeAsync(14, [9]), {
+  assert.equal((await session.invokeAsync(15, [9])).value, 10);
+  assert.deepEqual(await session.invokeAsync(16, [9]), {
     kind: 'item',
     value: 10,
   });
-  await session.invokeAsync(15, [9]);
+  await session.invokeAsync(17, [9]);
 
-  const output = session.invokeSync(10, [11]).value;
+  const output = session.invokeSync(12, [11]).value;
   assert.equal(output, host);
-  assert.equal((await session.invokeAsync(11, [output])).value, 89);
+  assert.equal((await session.invokeAsync(13, [output])).value, 89);
   // Calling cancel twice before the native Promise settles returns the same
   // in-flight settlement and invokes native cleanup only once.
   let cancel;
@@ -179,11 +191,11 @@ const object = { handle: 77 };
   } catch (error) {
     throw new Error(`output cancel Promise rejected: ${error}`);
   }
-  assert.equal(session.invokeSync(16, []).value, 111);
+  assert.equal(session.invokeSync(18, []).value, 111);
 
   const closeObject = { handle: 99 };
   assert.equal(session.invokeSync(5, [closeObject]).value, closeObject);
-  const closeOutput = session.invokeSync(10, [12]).value;
+  const closeOutput = session.invokeSync(12, [12]).value;
   await session.close();
   // Use a clean session so the assertion below cannot be satisfied merely by
   // an unrelated resource-release Promise.  close() must retain the session
@@ -208,24 +220,29 @@ const object = { handle: 77 };
   // close is idempotent after the first close has completed.
   await closeSession.close();
   const nextSession = addon.__uniffi_backend_factory(host);
-  assert.equal(nextSession.invokeSync(16, []).value, 222);
+  assert.equal(nextSession.invokeSync(18, []).value, 222);
   await nextSession.close();
   assert.deepEqual(callbackCalls, [
-    ['sync', 1, 10, 0, [5]],
+    ['sync', 0, 10, 1, [5]],
+    ['sync', 0, 10, 3, [6]],
     ['async', 0, 20, 0, 0, [5]],
-    ['async', 0, 20, 0, 1, [5]],
-    ['async', 0, 20, 0, 2, [6]],
-    ['async', 0, 20, 0, 3, [42]],
-    ['async', 0, 20, 0, 4, [77]],
-    ['async', 0, 20, 0, 5, [78]],
-    ['sync', 1, 10, 0, [99]],
+    ['async', 0, 20, 2, 1, [6]],
+    ['async', 0, 20, 0, 2, [5]],
+    ['async', 0, 20, 0, 3, [6]],
+    ['async', 0, 20, 0, 4, [42]],
+    ['async', 0, 20, 0, 5, [77]],
+    ['async', 0, 20, 0, 6, [78]],
+    ['async', 0, 20, 2, 7, [6]],
+    ['async', 0, 20, 2, 8, [42]],
+    ['sync', 0, 10, 3, [99]],
+    ['sync', 0, 10, 3, [88]],
     ['async', 0, 20, 0, 0, [55]],
   ]);
   assert.deepEqual(lifecycle, [
-    ['retain', 1, 10],
+    ['retain', 0, 10],
     ['retain', 0, 20],
+    ['release', 0, 10],
     ['release', 0, 20],
-    ['release', 1, 10],
   ]);
   assert.deepEqual(streams, [
     ['pull', 9],

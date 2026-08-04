@@ -15,8 +15,8 @@ use uniffi_js_abi::{
   ScalarType, TypeDefinition, TypeId, TypeSourceKey, ValueType,
 };
 use uniffi_js_engine_schema::{
-  BridgePlan, BridgePlanInput, CallbackCallStyle, CallbackContract, CallbackErrorStyle,
-  CallbackReentrancy, CallbackRetention, CallbackThreading, CallbackUseSite, PlannedOperation,
+  BridgePlan, BridgePlanInput, CallbackContract, CallbackReentrancy, CallbackRetention,
+  CallbackThreading, CallbackUseSite, PlannedOperation,
   StreamContract, StreamUseSite, ValuePath,
 };
 
@@ -60,8 +60,7 @@ fn operation(
 
 fn bridge() -> BridgePlan {
   let component = ComponentKey::new("ohos_generated_fixture").unwrap();
-  let async_observer = type_key(&component, "AsyncObserver");
-  let sync_observer = type_key(&component, "SyncObserver");
+  let observer = type_key(&component, "Observer");
   let thing = type_key(&component, "Thing");
   let failure = type_key(&component, "Failure");
   let byte_stream = type_key(&component, "ByteStream");
@@ -138,7 +137,7 @@ fn bridge() -> BridgePlan {
       OperationOwner::Namespace,
       OperationKind::Function,
       "observeSync",
-      vec![arg("observer", ValueType::Named(sync_observer.clone()))],
+      vec![arg("observer", ValueType::Named(observer.clone()))],
       Some(ValueType::Scalar(ScalarType::U32)),
       AsyncKind::Sync,
       Some(failure.clone()),
@@ -149,7 +148,7 @@ fn bridge() -> BridgePlan {
       OperationOwner::Namespace,
       OperationKind::Function,
       "observeAsync",
-      vec![arg("observer", ValueType::Named(async_observer.clone()))],
+      vec![arg("observer", ValueType::Named(observer.clone()))],
       Some(ValueType::Scalar(ScalarType::U32)),
       AsyncKind::Async,
       None,
@@ -157,9 +156,9 @@ fn bridge() -> BridgePlan {
     operation(
       &component,
       8,
-      OperationOwner::Callback(async_observer.clone()),
+      OperationOwner::Callback(observer.clone()),
       OperationKind::CallbackMethod,
-      "onValueAsync",
+      "onValueAsyncFallible",
       vec![arg("value", ValueType::Scalar(ScalarType::U32))],
       Some(ValueType::Scalar(ScalarType::U32)),
       AsyncKind::Async,
@@ -168,9 +167,9 @@ fn bridge() -> BridgePlan {
     operation(
       &component,
       9,
-      OperationOwner::Callback(sync_observer.clone()),
+      OperationOwner::Callback(observer.clone()),
       OperationKind::CallbackMethod,
-      "onValueSync",
+      "onValueSyncFallible",
       vec![arg("value", ValueType::Scalar(ScalarType::U32))],
       Some(ValueType::Scalar(ScalarType::U32)),
       AsyncKind::Sync,
@@ -179,17 +178,39 @@ fn bridge() -> BridgePlan {
     operation(
       &component,
       10,
+      OperationOwner::Callback(observer.clone()),
+      OperationKind::CallbackMethod,
+      "onValueAsyncInfallible",
+      vec![arg("value", ValueType::Scalar(ScalarType::U32))],
+      Some(ValueType::Scalar(ScalarType::U32)),
+      AsyncKind::Async,
+      None,
+    ),
+    operation(
+      &component,
+      11,
+      OperationOwner::Callback(observer.clone()),
+      OperationKind::CallbackMethod,
+      "onValueSyncInfallible",
+      vec![arg("value", ValueType::Scalar(ScalarType::U32))],
+      Some(ValueType::Scalar(ScalarType::U32)),
+      AsyncKind::Sync,
+      None,
+    ),
+    operation(
+      &component,
+      12,
       OperationOwner::Namespace,
       OperationKind::OutputStreamStart,
       "openStream",
-      vec![arg("observer", ValueType::Named(sync_observer.clone()))],
+      vec![arg("observer", ValueType::Named(observer.clone()))],
       Some(ValueType::output_stream(ValueType::Scalar(ScalarType::U32))),
       AsyncKind::Sync,
       None,
     ),
     operation(
       &component,
-      11,
+      13,
       OperationOwner::Object(byte_stream.clone()),
       OperationKind::OutputStreamNext,
       "nextStream",
@@ -200,7 +221,7 @@ fn bridge() -> BridgePlan {
     ),
     operation(
       &component,
-      12,
+      14,
       OperationOwner::Object(byte_stream.clone()),
       OperationKind::OutputStreamCancel,
       "cancelStream",
@@ -211,7 +232,7 @@ fn bridge() -> BridgePlan {
     ),
     operation(
       &component,
-      13,
+      15,
       OperationOwner::Namespace,
       OperationKind::Function,
       "consumeInput",
@@ -225,7 +246,7 @@ fn bridge() -> BridgePlan {
     ),
     operation(
       &component,
-      14,
+      16,
       OperationOwner::Namespace,
       OperationKind::InputStreamPull,
       "pullInput",
@@ -236,7 +257,7 @@ fn bridge() -> BridgePlan {
     ),
     operation(
       &component,
-      15,
+      17,
       OperationOwner::Namespace,
       OperationKind::InputStreamCancel,
       "cancelInput",
@@ -247,7 +268,7 @@ fn bridge() -> BridgePlan {
     ),
     operation(
       &component,
-      16,
+      18,
       OperationOwner::Namespace,
       OperationKind::Function,
       "releaseCount",
@@ -261,8 +282,6 @@ fn bridge() -> BridgePlan {
   let sync_contract = CallbackContract {
     retention: CallbackRetention::Retained,
     threading: CallbackThreading::CallingThread,
-    call_style: CallbackCallStyle::Sync,
-    error_style: CallbackErrorStyle::Fallible,
     reentrancy: CallbackReentrancy::Forbidden,
   };
   BridgePlan::build(BridgePlanInput {
@@ -273,28 +292,14 @@ fn bridge() -> BridgePlan {
     types: vec![
       IdentifiedType {
         id: TypeId::new(0),
-        definition: TypeDefinition::new(
-          async_observer,
-          "AsyncObserver",
-          NamedTypeKind::Callback,
-        )
-        .unwrap(),
+        definition: TypeDefinition::new(observer, "Observer", NamedTypeKind::Callback).unwrap(),
       },
       IdentifiedType {
         id: TypeId::new(1),
-        definition: TypeDefinition::new(
-          sync_observer,
-          "SyncObserver",
-          NamedTypeKind::Callback,
-        )
-        .unwrap(),
-      },
-      IdentifiedType {
-        id: TypeId::new(2),
         definition: TypeDefinition::new(thing, "Thing", NamedTypeKind::Object).unwrap(),
       },
       IdentifiedType {
-        id: TypeId::new(3),
+        id: TypeId::new(2),
         definition: TypeDefinition::new(
           failure,
           "Failure",
@@ -305,7 +310,7 @@ fn bridge() -> BridgePlan {
         .unwrap(),
       },
       IdentifiedType {
-        id: TypeId::new(4),
+        id: TypeId::new(3),
         definition: TypeDefinition::new(byte_stream, "ByteStream", NamedTypeKind::Object).unwrap(),
       },
     ],
@@ -313,7 +318,7 @@ fn bridge() -> BridgePlan {
     callbacks: vec![
       CallbackUseSite {
         operation_id: OperationId::new(6),
-        callback_type: TypeId::new(1),
+        callback_type: TypeId::new(0),
         path: ValuePath::argument(0),
         contract: sync_contract.clone(),
       },
@@ -323,15 +328,16 @@ fn bridge() -> BridgePlan {
         path: ValuePath::argument(0),
         contract: CallbackContract {
           retention: CallbackRetention::Retained,
-          threading: CallbackThreading::MayCrossThread,
-          call_style: CallbackCallStyle::Async,
-          error_style: CallbackErrorStyle::Fallible,
+          // The mixed callback interface contains synchronous methods, so a
+          // single use-site cannot promise cross-thread entry.  The async
+          // methods still use a real TSFN for safe worker-to-Ark dispatch.
+          threading: CallbackThreading::CallingThread,
           reentrancy: CallbackReentrancy::Forbidden,
         },
       },
       CallbackUseSite {
-        operation_id: OperationId::new(10),
-        callback_type: TypeId::new(1),
+        operation_id: OperationId::new(12),
+        callback_type: TypeId::new(0),
         path: ValuePath::argument(0),
         contract: CallbackContract {
           retention: CallbackRetention::Scoped,
@@ -341,12 +347,12 @@ fn bridge() -> BridgePlan {
     ],
     streams: vec![
       StreamUseSite {
-        operation_id: OperationId::new(10),
+        operation_id: OperationId::new(12),
         path: ValuePath::return_value(),
         contract: StreamContract::output(),
       },
       StreamUseSite {
-        operation_id: OperationId::new(13),
+        operation_id: OperationId::new(15),
         path: ValuePath::argument(0),
         contract: StreamContract::input(),
       },
@@ -487,8 +493,10 @@ fn operation_plans(bridge: &BridgePlan) -> OhosBridgePlan {
       ),
       host(8, OhosOperationTarget::CallbackHost),
       host(9, OhosOperationTarget::CallbackHost),
+      host(10, OhosOperationTarget::CallbackHost),
+      host(11, OhosOperationTarget::CallbackHost),
       native(
-        10,
+        12,
         syn::parse_quote!(crate::generated_fixture::open_stream),
         vec![OhosArgumentPlan {
           name: name("observer"),
@@ -504,7 +512,7 @@ fn operation_plans(bridge: &BridgePlan) -> OhosBridgePlan {
         OhosErrorBinding::Infallible,
       ),
       OhosOperationPlan {
-        operation_id: OperationId::new(11),
+        operation_id: OperationId::new(13),
         target: OhosOperationTarget::Native {
           call: syn::parse_quote!(crate::generated_fixture::next_stream),
         },
@@ -524,7 +532,7 @@ fn operation_plans(bridge: &BridgePlan) -> OhosBridgePlan {
         error_binding: OhosErrorBinding::Infallible,
       },
       OhosOperationPlan {
-        operation_id: OperationId::new(12),
+        operation_id: OperationId::new(14),
         target: OhosOperationTarget::Native {
           call: syn::parse_quote!(crate::generated_fixture::cancel_stream),
         },
@@ -541,7 +549,7 @@ fn operation_plans(bridge: &BridgePlan) -> OhosBridgePlan {
         error_binding: OhosErrorBinding::Infallible,
       },
       native(
-        13,
+        15,
         syn::parse_quote!(crate::generated_fixture::consume_input),
         vec![OhosArgumentPlan {
           name: name("source"),
@@ -555,10 +563,10 @@ fn operation_plans(bridge: &BridgePlan) -> OhosBridgePlan {
         },
         OhosErrorBinding::Infallible,
       ),
-      host(14, OhosOperationTarget::InputStreamHostPull),
-      host(15, OhosOperationTarget::InputStreamHostCancel),
+      host(16, OhosOperationTarget::InputStreamHostPull),
+      host(17, OhosOperationTarget::InputStreamHostCancel),
       native(
-        16,
+        18,
         syn::parse_quote!(crate::generated_fixture::release_count),
         Vec::new(),
         OhosReturnBinding::Direct {

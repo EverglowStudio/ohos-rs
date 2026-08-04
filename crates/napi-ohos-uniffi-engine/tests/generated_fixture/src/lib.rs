@@ -14,7 +14,7 @@ mod generated_fixture {
   use napi_ohos::{threadsafe_function::ThreadsafeFunction, Status};
   use napi_ohos_uniffi_engine::{
     BridgeErrorDescriptor, ErrorData, ErrorDomain, SessionCallbackArgument,
-    SessionCallbackCallStyle, SessionCallbackErrorStyle, SessionCallbackRetention,
+    SessionCallbackRetention,
     SessionCallbackThreading,
   };
 
@@ -77,13 +77,13 @@ mod generated_fixture {
   }
 
   impl SyncObserverProxy {
-    fn call(&self, value: u32) -> Result<u32, BridgeErrorDescriptor> {
-      self.call_napi(value).map_err(|error| {
+    fn call(&self, value: u32, method_id: u32) -> Result<u32, BridgeErrorDescriptor> {
+      self.call_napi(value, method_id).map_err(|error| {
         BridgeErrorDescriptor::backend(format!("sync callback dispatch failed: {error}"))
       })
     }
 
-    fn call_napi(&self, value: u32) -> napi_ohos::Result<u32> {
+    fn call_napi(&self, value: u32, method_id: u32) -> napi_ohos::Result<u32> {
       let env = self.host.value().env;
       let name = CString::new("invokeCallbackSync")?;
       let mut function = ptr::null_mut();
@@ -92,7 +92,7 @@ mod generated_fixture {
       })?;
       let callback_type = unsafe { u32::to_napi_value(env, self.callback_type_id)? };
       let callback_id = unsafe { u32::to_napi_value(env, self.callback_id)? };
-      let method_id = unsafe { u32::to_napi_value(env, 0)? };
+      let method_id = unsafe { u32::to_napi_value(env, method_id)? };
       let args = unsafe { Vec::<u32>::to_napi_value(env, vec![value])? };
       let mut result = ptr::null_mut();
       napi_ohos::check_status!(unsafe {
@@ -117,8 +117,6 @@ mod generated_fixture {
   ) -> napi_ohos::Result<SyncObserverProxy> {
     if contract.retention != SessionCallbackRetention::Retained
       || contract.threading != SessionCallbackThreading::CallingThread
-      || contract.call_style != SessionCallbackCallStyle::Sync
-      || contract.error_style != SessionCallbackErrorStyle::Fallible
     {
       return Err(napi_ohos::Error::new(
         napi_ohos::Status::InvalidArg,
@@ -133,7 +131,9 @@ mod generated_fixture {
   }
 
   pub fn observe_sync(observer: SyncObserverProxy) -> Result<u32, BridgeErrorDescriptor> {
-    observer.call(5)
+    let fallible = observer.call(5, 1)?;
+    let infallible = observer.call(6, 3)?;
+    Ok(fallible + infallible)
   }
 
   type AsyncCallbackArgs = FnArgs<(u32, u32, u32, u32, Vec<u32>)>;
@@ -153,9 +153,7 @@ mod generated_fixture {
     contract: SessionCallbackArgument,
   ) -> napi_ohos::Result<AsyncObserverProxy> {
     if contract.retention != SessionCallbackRetention::Retained
-      || contract.threading != SessionCallbackThreading::MayCrossThread
-      || contract.call_style != SessionCallbackCallStyle::Async
-      || contract.error_style != SessionCallbackErrorStyle::Fallible
+      || contract.threading != SessionCallbackThreading::CallingThread
     {
       return Err(napi_ohos::Error::new(
         napi_ohos::Status::InvalidArg,
@@ -182,20 +180,34 @@ mod generated_fixture {
   }
 
   pub async fn observe_async(observer: AsyncObserverProxy) -> u32 {
-    let invocation = observer
-      .callback
-      .call_async(AsyncCallbackArgs::from((
-        observer.callback_type_id,
-        observer.callback_id,
-        0,
-        0,
-        vec![5],
-      )))
+    let fallible = observer
+      .call(5, 0)
       .await
-      .expect("Host.invokeCallbackAsync TSFN dispatch failed");
-    invocation
+      .expect("Host.invokeCallbackAsync fallible dispatch/rejection");
+    let infallible = observer
+      .call(6, 2)
       .await
-      .expect("Host.invokeCallbackAsync Promise rejected")
+      .expect("Host.invokeCallbackAsync infallible dispatch/rejection");
+    fallible + infallible
+  }
+
+  impl AsyncObserverProxy {
+    async fn call(&self, value: u32, method_id: u32) -> Result<u32, napi_ohos::Error> {
+      let invocation = self
+        .callback
+        .call_async(AsyncCallbackArgs::from((
+          self.callback_type_id,
+          self.callback_id,
+          method_id,
+          0,
+          vec![value],
+        )))
+        .await
+        .map_err(|error| napi_ohos::Error::new(Status::GenericFailure, error.to_string()))?;
+      invocation
+        .await
+        .map_err(|error| napi_ohos::Error::new(Status::GenericFailure, error.to_string()))
+    }
   }
 
   pub struct StreamFactoryProxy(Object<'static>);
@@ -206,8 +218,7 @@ mod generated_fixture {
     _callback_id: u32,
     contract: SessionCallbackArgument,
   ) -> napi_ohos::Result<StreamFactoryProxy> {
-    if contract.call_style != SessionCallbackCallStyle::Sync
-      || contract.threading != SessionCallbackThreading::CallingThread
+    if contract.threading != SessionCallbackThreading::CallingThread
     {
       return Err(napi_ohos::Error::new(
         napi_ohos::Status::InvalidArg,

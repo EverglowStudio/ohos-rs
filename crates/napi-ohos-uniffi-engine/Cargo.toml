@@ -9,13 +9,13 @@ rust-version.workspace = true
 
 [dependencies]
 napi-ohos = { path = "../napi", version = "=1.2.0", default-features = false, features = ["napi8", "tokio_rt"] }
-napi-family-core = { git = "https://github.com/EverglowStudio/napi-rs.git", rev = "6fdf482d26efd06d3cf2d49e164549a1387a6f91", version = "=0.1.0" }
+napi-family-core = { git = "https://github.com/EverglowStudio/napi-rs.git", rev = "85a0cafd759f9a17baad01f495988c8e38a8c085", version = "=0.1.0" }
 napi-derive-backend-ohos = { path = "../backend", version = "=1.2.0" }
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full"] }
-uniffi_js_abi = { git = "https://github.com/EverglowStudio/uniffi-rs.git", rev = "c87db9d984da6c065490dda864bdd13c6ab59f0b", version = "=0.32.0" }
-uniffi_js_engine_schema = { git = "https://github.com/EverglowStudio/uniffi-rs.git", rev = "c87db9d984da6c065490dda864bdd13c6ab59f0b", version = "=0.32.0" }
+uniffi_js_abi = { git = "https://github.com/EverglowStudio/uniffi-rs.git", rev = "4361fc73c10e36bdfc3fd0438ed63d9f2e130cd4", version = "=0.32.0" }
+uniffi_js_engine_schema = { git = "https://github.com/EverglowStudio/uniffi-rs.git", rev = "4361fc73c10e36bdfc3fd0438ed63d9f2e130cd4", version = "=0.32.0" }
 
 [dev-dependencies]
 futures = "0.3"

@@ -150,7 +150,7 @@ dependencies = [
 [[package]]
 name = "napi-family-core"
 version = "0.1.0"
-source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=6fdf482d26efd06d3cf2d49e164549a1387a6f91#6fdf482d26efd06d3cf2d49e164549a1387a6f91"
+source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=85a0cafd759f9a17baad01f495988c8e38a8c085#85a0cafd759f9a17baad01f495988c8e38a8c085"
 dependencies = [
  "uniffi_js_abi",
  "uniffi_js_engine_schema",
@@ -281,12 +281,12 @@ checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 [[package]]
 name = "uniffi_js_abi"
 version = "0.32.0"
-source = "git+https://github.com/EverglowStudio/uniffi-rs.git?rev=c87db9d984da6c065490dda864bdd13c6ab59f0b#c87db9d984da6c065490dda864bdd13c6ab59f0b"
+source = "git+https://github.com/EverglowStudio/uniffi-rs.git?rev=4361fc73c10e36bdfc3fd0438ed63d9f2e130cd4#4361fc73c10e36bdfc3fd0438ed63d9f2e130cd4"
 
 [[package]]
 name = "uniffi_js_engine_schema"
 version = "0.32.0"
-source = "git+https://github.com/EverglowStudio/uniffi-rs.git?rev=c87db9d984da6c065490dda864bdd13c6ab59f0b#c87db9d984da6c065490dda864bdd13c6ab59f0b"
+source = "git+https://github.com/EverglowStudio/uniffi-rs.git?rev=4361fc73c10e36bdfc3fd0438ed63d9f2e130cd4#4361fc73c10e36bdfc3fd0438ed63d9f2e130cd4"
 dependencies = [
  "uniffi_js_abi",
 ]

@@ -25,8 +25,8 @@ use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
 use uniffi_js_abi::{AsyncKind, OperationId, OperationKind};
 use uniffi_js_engine_schema::{
-  BridgePlan, CallbackCallStyle, CallbackErrorStyle, CallbackReentrancy, CallbackRetention,
-  CallbackThreading, StreamDirection, ValuePathSegment,
+  BridgePlan, CallbackReentrancy, CallbackRetention, CallbackThreading, StreamDirection,
+  ValuePathSegment,
 };
 
 pub use napi_family_core;
@@ -34,11 +34,10 @@ mod plan;
 pub use plan::*;
 mod session;
 pub use session::{
-  create_backend_session, SessionCallbackArgument, SessionCallbackCallStyle,
-  SessionCallbackErrorStyle, SessionCallbackReentrancy, SessionCallbackRetention,
-  SessionCallbackThreading, SessionNativeCall, SessionOperationDescriptor,
-  SessionOperationDispatch, SessionResourceCallbacks, SessionResourceReceiver,
-  SessionStreamArgument, SessionStreamDirection,
+  create_backend_session, SessionCallbackArgument, SessionCallbackErrorStyle,
+  SessionCallbackReentrancy, SessionCallbackRetention, SessionCallbackThreading, SessionNativeCall,
+  SessionOperationDescriptor, SessionOperationDispatch, SessionResourceCallbacks,
+  SessionResourceReceiver, SessionStreamArgument, SessionStreamDirection,
 };
 
 /// The single public native export installed by a generated OHOS module.
@@ -807,18 +806,6 @@ fn callback_contract_tokens(
       quote!(napi_ohos_uniffi_engine::SessionCallbackThreading::MayCrossThread)
     }
   };
-  let call_style = match callback.contract.call_style {
-    CallbackCallStyle::Sync => quote!(napi_ohos_uniffi_engine::SessionCallbackCallStyle::Sync),
-    CallbackCallStyle::Async => quote!(napi_ohos_uniffi_engine::SessionCallbackCallStyle::Async),
-  };
-  let error_style = match callback.contract.error_style {
-    CallbackErrorStyle::Infallible => {
-      quote!(napi_ohos_uniffi_engine::SessionCallbackErrorStyle::Infallible)
-    }
-    CallbackErrorStyle::Fallible => {
-      quote!(napi_ohos_uniffi_engine::SessionCallbackErrorStyle::Fallible)
-    }
-  };
   let reentrancy = match callback.contract.reentrancy {
     CallbackReentrancy::Allowed => {
       quote!(napi_ohos_uniffi_engine::SessionCallbackReentrancy::Allowed)
@@ -833,8 +820,6 @@ fn callback_contract_tokens(
       callback_type_id: #callback_type_id,
       retention: #retention,
       threading: #threading,
-      call_style: #call_style,
-      error_style: #error_style,
       reentrancy: #reentrancy,
     }
   }
@@ -939,15 +924,24 @@ fn session_descriptor_tokens(
     FamilyOperationTarget::CallbackHost(method) => {
       let callback_type_id = method.callback_type.index();
       let method_id = method.method_id;
+      let error_style = if family_operation.declared_error.is_some() {
+        quote!(napi_ohos_uniffi_engine::SessionCallbackErrorStyle::Fallible)
+      } else {
+        quote!(napi_ohos_uniffi_engine::SessionCallbackErrorStyle::Infallible)
+      };
       match family_operation.async_kind {
         AsyncKind::Sync => quote! {
           napi_ohos_uniffi_engine::SessionOperationDispatch::CallbackHostSync {
-            callback_type_id: #callback_type_id, method_id: #method_id,
+            callback_type_id: #callback_type_id,
+            method_id: #method_id,
+            error_style: #error_style,
           }
         },
         AsyncKind::Async => quote! {
           napi_ohos_uniffi_engine::SessionOperationDispatch::CallbackHostAsync {
-            callback_type_id: #callback_type_id, method_id: #method_id,
+            callback_type_id: #callback_type_id,
+            method_id: #method_id,
+            error_style: #error_style,
           }
         },
       }
@@ -1040,20 +1034,6 @@ fn session_descriptor_tokens(
           quote!(napi_ohos_uniffi_engine::SessionCallbackThreading::MayCrossThread)
         }
       };
-      let call_style = match use_site.contract.call_style {
-        CallbackCallStyle::Sync => quote!(napi_ohos_uniffi_engine::SessionCallbackCallStyle::Sync),
-        CallbackCallStyle::Async => {
-          quote!(napi_ohos_uniffi_engine::SessionCallbackCallStyle::Async)
-        }
-      };
-      let error_style = match use_site.contract.error_style {
-        CallbackErrorStyle::Infallible => {
-          quote!(napi_ohos_uniffi_engine::SessionCallbackErrorStyle::Infallible)
-        }
-        CallbackErrorStyle::Fallible => {
-          quote!(napi_ohos_uniffi_engine::SessionCallbackErrorStyle::Fallible)
-        }
-      };
       let reentrancy = match use_site.contract.reentrancy {
         CallbackReentrancy::Allowed => {
           quote!(napi_ohos_uniffi_engine::SessionCallbackReentrancy::Allowed)
@@ -1068,8 +1048,6 @@ fn session_descriptor_tokens(
           callback_type_id: #callback_type_id,
           retention: #retention,
           threading: #threading,
-          call_style: #call_style,
-          error_style: #error_style,
           reentrancy: #reentrancy,
         }
       })
@@ -1396,12 +1374,7 @@ impl<H: OhosHost> OhosBackendSession<H> {
           callback,
           method.method_id,
           args,
-          operation
-            .callbacks
-            .iter()
-            .find(|use_site| use_site.callback_type.index() == method.callback_type.index())
-            .map(|use_site| use_site.contract.reentrancy)
-            .unwrap_or(CallbackReentrancy::Allowed),
+          self.callback_reentrancy_for_method(operation, method.callback_type.index()),
         )
       }
       FamilyOperationTarget::InputStreamHostPull => {
@@ -1449,12 +1422,8 @@ impl<H: OhosHost> OhosBackendSession<H> {
     let callback_guard = match target {
       FamilyOperationTarget::CallbackHost(method) => {
         let callback = callback_id(&args)?;
-        let reentrancy = operation
-          .callbacks
-          .iter()
-          .find(|use_site| use_site.callback_type.index() == method.callback_type.index())
-          .map(|use_site| use_site.contract.reentrancy)
-          .unwrap_or(CallbackReentrancy::Allowed);
+        let reentrancy =
+          self.callback_reentrancy_for_method(operation, method.callback_type.index());
         if reentrancy == CallbackReentrancy::Forbidden {
           let mut locked = self
             .state
@@ -1553,7 +1522,7 @@ impl<H: OhosHost> OhosBackendSession<H> {
       callback_id,
       method_id,
       args,
-      CallbackReentrancy::Allowed,
+      self.callback_reentrancy_for_type(callback_type),
     )
   }
 
@@ -1796,6 +1765,56 @@ impl<H: OhosHost> OhosBackendSession<H> {
       .iter()
       .find(|operation| operation.id == operation_id)
       .ok_or(OhosEngineError::UnknownOperation { operation_id })
+  }
+
+  fn callback_reentrancy_for_type(&self, callback_type_id: u32) -> CallbackReentrancy {
+    self
+      .family
+      .operations()
+      .iter()
+      .flat_map(|operation| operation.callbacks.iter())
+      .filter(|use_site| use_site.callback_type.index() == callback_type_id)
+      .map(|use_site| use_site.contract.reentrancy)
+      .find(|policy| *policy == CallbackReentrancy::Forbidden)
+      .unwrap_or(CallbackReentrancy::Allowed)
+  }
+
+  /// Callback methods have their async/error shape on the method operation,
+  /// while reentrancy is a use-site lifecycle policy.  A callback method
+  /// operation has no callback argument itself, so never default to Allowed
+  /// merely because its local callback list is empty.  Aggregate all known
+  /// use-sites for the callback type and let a Forbidden policy win; this
+  /// avoids first-use-site registry selection and preserves overlap safety.
+  fn callback_reentrancy_for_method(
+    &self,
+    operation: &napi_family_core::FamilyOperation,
+    callback_type_id: u32,
+  ) -> CallbackReentrancy {
+    let operation_policy = operation
+      .callbacks
+      .iter()
+      .filter(|use_site| use_site.callback_type.index() == callback_type_id)
+      .map(|use_site| use_site.contract.reentrancy)
+      .find(|policy| *policy == CallbackReentrancy::Forbidden);
+    if operation_policy.is_some() {
+      return CallbackReentrancy::Forbidden;
+    }
+    if operation
+      .callbacks
+      .iter()
+      .any(|use_site| use_site.callback_type.index() == callback_type_id)
+    {
+      return CallbackReentrancy::Allowed;
+    }
+    self
+      .family
+      .operations()
+      .iter()
+      .flat_map(|candidate| candidate.callbacks.iter())
+      .filter(|use_site| use_site.callback_type.index() == callback_type_id)
+      .map(|use_site| use_site.contract.reentrancy)
+      .find(|policy| *policy == CallbackReentrancy::Forbidden)
+      .unwrap_or(CallbackReentrancy::Allowed)
   }
 
   fn track_inputs_and_objects(

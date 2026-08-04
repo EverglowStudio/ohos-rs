@@ -1,6 +1,5 @@
 use super::*;
 use proc_macro2::{Ident, Span};
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use uniffi_js_abi::{
@@ -10,9 +9,8 @@ use uniffi_js_abi::{
   OperationSourceKey, Ownership, ScalarType, TypeDefinition, TypeId, TypeSourceKey, ValueType,
 };
 use uniffi_js_engine_schema::{
-  BridgePlan, BridgePlanInput, CallbackCallStyle, CallbackContract, CallbackErrorStyle,
-  CallbackReentrancy, CallbackRetention, CallbackThreading, CallbackUseSite, PlannedOperation,
-  StreamContract, StreamUseSite, ValuePath,
+  BridgePlan, BridgePlanInput, CallbackContract, CallbackReentrancy, CallbackRetention,
+  CallbackThreading, CallbackUseSite, PlannedOperation, StreamContract, StreamUseSite, ValuePath,
 };
 
 fn ident(name: &str) -> Ident {
@@ -462,8 +460,6 @@ fn structured_bridge() -> BridgePlan {
       contract: CallbackContract {
         retention: CallbackRetention::Retained,
         threading: CallbackThreading::MayCrossThread,
-        call_style: CallbackCallStyle::Async,
-        error_style: CallbackErrorStyle::Fallible,
         reentrancy: CallbackReentrancy::Forbidden,
       },
     }],
@@ -800,6 +796,7 @@ fn generated_source_uses_structured_plan_and_only_exports_factory() {
   assert!(source.contains("__uniffi_backend_factory"));
   assert!(source.contains("create_backend_session"));
   assert!(source.contains("SessionOperationDispatch :: CallbackHostAsync"));
+  assert!(source.contains("SessionCallbackErrorStyle :: Fallible"));
   assert!(source.contains("SessionOperationDispatch :: InputStreamHostPull"));
   assert!(source.contains("SessionOperationDispatch :: InputStreamHostCancel"));
   assert_eq!(
@@ -1237,8 +1234,6 @@ fn callback_contract_is_scoped_to_operation_use_site() {
     callback_type_id: 7,
     retention: SessionCallbackRetention::Scoped,
     threading: SessionCallbackThreading::CallingThread,
-    call_style: SessionCallbackCallStyle::Sync,
-    error_style: SessionCallbackErrorStyle::Infallible,
     reentrancy: SessionCallbackReentrancy::Allowed,
   };
   let forbidden = SessionCallbackArgument {
@@ -1253,28 +1248,23 @@ fn callback_contract_is_scoped_to_operation_use_site() {
     super::session::callback_reentrancy_for_operation(&[forbidden], 7),
     SessionCallbackReentrancy::Forbidden
   );
+}
 
-  let mut registry = BTreeMap::new();
-  registry.insert(
-    super::session::CallbackKey {
-      callback_type_id: 7,
-      callback_id: 10,
-    },
-    allowed,
-  );
-  registry.insert(
-    super::session::CallbackKey {
-      callback_type_id: 7,
-      callback_id: 11,
-    },
-    forbidden,
-  );
-  assert_eq!(
-    super::session::callback_reentrancy_for_registry(&registry, 7, 10),
-    SessionCallbackReentrancy::Allowed
-  );
-  assert_eq!(
-    super::session::callback_reentrancy_for_registry(&registry, 7, 11),
-    SessionCallbackReentrancy::Forbidden
-  );
+#[test]
+fn callback_method_dispatch_uses_registered_forbidden_reentrancy() {
+  let bridge = structured_bridge();
+  let module = generate_ohos_module(&bridge, structured_plan(&bridge)).unwrap();
+  let session = OhosBackendFactory::new(module).open(FixtureHost::default());
+  let first = session
+    .invoke_async(OperationId::new(3), vec![OhosValue::Callback(7)])
+    .unwrap();
+  let second = session.invoke_async(OperationId::new(3), vec![OhosValue::Callback(7)]);
+  assert!(matches!(
+    second,
+    Err(OhosEngineError::ReentrancyForbidden {
+      callback_type: 3,
+      callback_id: 7,
+    })
+  ));
+  assert_eq!(futures::executor::block_on(first), Ok(OhosValue::Unit));
 }

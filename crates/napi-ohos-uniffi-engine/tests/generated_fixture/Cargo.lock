@@ -150,11 +150,7 @@ dependencies = [
 [[package]]
 name = "napi-family-core"
 version = "0.1.0"
-source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=85a0cafd759f9a17baad01f495988c8e38a8c085#85a0cafd759f9a17baad01f495988c8e38a8c085"
-dependencies = [
- "uniffi_js_abi",
- "uniffi_js_engine_schema",
-]
+source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=d5adb80d5508c6b9eb556ce0b2ae6d744960c750#d5adb80d5508c6b9eb556ce0b2ae6d744960c750"
 
 [[package]]
 name = "napi-ohos"
@@ -180,8 +176,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
- "uniffi_js_abi",
- "uniffi_js_engine_schema",
 ]
 
 [[package]]
@@ -193,8 +187,6 @@ dependencies = [
  "napi-ohos-uniffi-engine",
  "proc-macro2",
  "syn",
- "uniffi_js_abi",
- "uniffi_js_engine_schema",
 ]
 
 [[package]]
@@ -277,19 +269,6 @@ name = "unicode-segmentation"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
-
-[[package]]
-name = "uniffi_js_abi"
-version = "0.32.0"
-source = "git+https://github.com/EverglowStudio/uniffi-rs.git?rev=4361fc73c10e36bdfc3fd0438ed63d9f2e130cd4#4361fc73c10e36bdfc3fd0438ed63d9f2e130cd4"
-
-[[package]]
-name = "uniffi_js_engine_schema"
-version = "0.32.0"
-source = "git+https://github.com/EverglowStudio/uniffi-rs.git?rev=4361fc73c10e36bdfc3fd0438ed63d9f2e130cd4#4361fc73c10e36bdfc3fd0438ed63d9f2e130cd4"
-dependencies = [
- "uniffi_js_abi",
-]
 
 [[package]]
 name = "windows-link"

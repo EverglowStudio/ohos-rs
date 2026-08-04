@@ -1,13 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use napi_family_core::{
+  FamilyOperation, FamilyOperationTarget, FamilyPlan, ResourceKind, ResourceOwnership,
+  StreamDirection, ValuePathSegment,
+};
 use proc_macro2::Ident;
 use syn::{Path, Type};
-use uniffi_js_abi::{OperationId, OperationKind, OperationOwner, Ownership, ScalarType, ValueType};
-use uniffi_js_engine_schema::{BridgePlan, Capability};
 
 use crate::OhosEngineError;
 
-/// Structured lowering for one public carrier argument.
+/// Structured lowering for one public carrier argument.  These are the only
+/// OHOS-owned Rust details consumed by the engine; names and carrier graphs
+/// remain in the frontend's engine-owned [`FamilyPlan`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OhosArgumentBinding {
   Direct {
@@ -22,12 +26,12 @@ pub enum OhosArgumentBinding {
   ObjectLease {
     carrier_type: Type,
     lower: Path,
-    ownership: Ownership,
+    ownership: ResourceOwnership,
   },
   OutputStreamLease {
     carrier_type: Type,
     lower: Path,
-    ownership: Ownership,
+    ownership: ResourceOwnership,
   },
   CallbackProxy {
     rust_type: Type,
@@ -46,9 +50,7 @@ impl OhosArgumentBinding {
       | Self::LowerWith { carrier_type, .. }
       | Self::ObjectLease { carrier_type, .. }
       | Self::OutputStreamLease { carrier_type, .. } => carrier_type.clone(),
-      Self::I64BigInt | Self::U64BigInt => {
-        syn::parse_quote!(napi_ohos::bindgen_prelude::BigInt)
-      }
+      Self::I64BigInt | Self::U64BigInt => syn::parse_quote!(napi_ohos::bindgen_prelude::BigInt),
       Self::CallbackProxy { .. } | Self::InputStreamProxy { .. } => syn::parse_quote!(u32),
     }
   }
@@ -90,9 +92,7 @@ impl OhosReturnBinding {
       | Self::ObjectLease { carrier_type, .. }
       | Self::CallbackLease { carrier_type, .. }
       | Self::OutputStreamLease { carrier_type, .. } => carrier_type.clone(),
-      Self::I64BigInt | Self::U64BigInt => {
-        syn::parse_quote!(napi_ohos::bindgen_prelude::BigInt)
-      }
+      Self::I64BigInt | Self::U64BigInt => syn::parse_quote!(napi_ohos::bindgen_prelude::BigInt),
     }
   }
 }
@@ -119,7 +119,7 @@ pub struct OhosReceiverPlan {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OhosOperationPlan {
-  pub operation_id: OperationId,
+  pub operation_id: u32,
   pub target: OhosOperationTarget,
   pub receiver: Option<OhosReceiverPlan>,
   pub arguments: Vec<OhosArgumentPlan>,
@@ -148,67 +148,72 @@ pub struct OhosBridgePlan {
 
 impl OhosBridgePlan {
   pub fn build(
-    bridge: &BridgePlan,
+    family: &FamilyPlan,
     operations: Vec<OhosOperationPlan>,
   ) -> Result<Self, OhosEngineError> {
-    Self::build_with_resource_hooks(bridge, operations, OhosResourceHooks::default())
+    Self::build_with_resource_hooks(family, operations, OhosResourceHooks::default())
   }
 
   pub fn build_with_resource_hooks(
-    bridge: &BridgePlan,
+    family: &FamilyPlan,
     operations: Vec<OhosOperationPlan>,
     resource_hooks: OhosResourceHooks,
   ) -> Result<Self, OhosEngineError> {
-    let type_kinds = bridge
-      .types()
-      .iter()
-      .map(|ty| (&ty.definition.source_key, &ty.definition.kind))
-      .collect::<BTreeMap<_, _>>();
     let mut by_id = BTreeMap::new();
     for operation in operations {
-      let id = operation.operation_id.index();
+      let id = operation.operation_id;
       if by_id.insert(id, operation).is_some() {
         return Err(OhosEngineError::DuplicateRustOperation { id });
       }
     }
-    if by_id.len() != bridge.operations().len() {
+    if by_id.len() != family.operations().len() {
       return Err(OhosEngineError::OperationCount {
-        expected: bridge.operations().len(),
+        expected: family.operations().len(),
         actual: by_id.len(),
       });
     }
 
     let mut validated = Vec::with_capacity(by_id.len());
-    for (expected, bridge_operation) in bridge.operations().iter().enumerate() {
-      let expected = u32::try_from(expected).map_err(|_| OhosEngineError::TooManyOperations)?;
+    for family_operation in family.operations() {
+      let expected = family_operation.id;
       let Some(operation) = by_id.remove(&expected) else {
         return Err(OhosEngineError::MissingRustOperation { id: expected });
       };
-      let signature = &bridge_operation.operation.definition.signature;
-      validate_target(
-        bridge_operation.operation.definition.source_key.kind(),
-        &operation,
-      )?;
+      validate_target(family_operation, &operation)?;
       let native = matches!(operation.target, OhosOperationTarget::Native { .. });
       if native {
-        if operation.arguments.len() != signature.arguments.len() {
+        if operation.arguments.len() != family_operation.argument_count {
           return Err(OhosEngineError::ArgumentCount {
             operation_id: operation.operation_id,
-            expected: signature.arguments.len(),
+            expected: family_operation.argument_count,
             actual: operation.arguments.len(),
           });
         }
-        validate_receiver(
-          bridge_operation.operation.definition.source_key.owner(),
-          bridge_operation.operation.definition.source_key.kind(),
-          &operation,
-        )?;
-      } else if operation.receiver.is_some() || !operation.arguments.is_empty() {
+        validate_receiver(family_operation, &operation)?;
+        validate_result_resource(family_operation, &operation)?;
+        validate_structured_bindings(family_operation, &operation)?;
+        match (family_operation.fallible, &operation.error_binding) {
+          (false, OhosErrorBinding::Infallible) | (true, OhosErrorBinding::Descriptor { .. }) => {}
+          (true, OhosErrorBinding::Infallible) => {
+            return Err(OhosEngineError::MissingErrorDescriptor {
+              operation_id: operation.operation_id,
+            });
+          }
+          (false, OhosErrorBinding::Descriptor { .. }) => {
+            return Err(OhosEngineError::UnexpectedErrorDescriptor {
+              operation_id: operation.operation_id,
+            });
+          }
+        }
+      } else if operation.receiver.is_some()
+        || !operation.arguments.is_empty()
+        || !matches!(operation.return_binding, OhosReturnBinding::Unit)
+        || !matches!(operation.error_binding, OhosErrorBinding::Infallible)
+      {
         return Err(OhosEngineError::HostOperationHasRustBindings {
           operation_id: operation.operation_id,
         });
       }
-
       let mut names = BTreeSet::new();
       if let Some(receiver) = &operation.receiver {
         names.insert(receiver.name.to_string());
@@ -222,48 +227,9 @@ impl OhosBridgePlan {
           });
         }
       }
-
-      if native {
-        for (index, (argument, semantic)) in operation
-          .arguments
-          .iter()
-          .zip(&signature.arguments)
-          .enumerate()
-        {
-          validate_argument(
-            operation.operation_id,
-            index,
-            &semantic.ty,
-            semantic.ownership,
-            &argument.binding,
-            &type_kinds,
-          )?;
-        }
-        validate_return(
-          operation.operation_id,
-          signature.return_type.as_ref(),
-          &operation.return_binding,
-          &type_kinds,
-        )?;
-        match (&signature.throws, &operation.error_binding) {
-          (None, OhosErrorBinding::Infallible) | (Some(_), OhosErrorBinding::Descriptor { .. }) => {
-          }
-          (Some(_), OhosErrorBinding::Infallible) => {
-            return Err(OhosEngineError::MissingErrorDescriptor {
-              operation_id: operation.operation_id,
-            })
-          }
-          (None, OhosErrorBinding::Descriptor { .. }) => {
-            return Err(OhosEngineError::UnexpectedErrorDescriptor {
-              operation_id: operation.operation_id,
-            })
-          }
-        }
-      }
       validated.push(operation);
     }
-
-    validate_resource_hooks(bridge, &resource_hooks)?;
+    validate_resource_hooks(family, &resource_hooks)?;
     Ok(Self {
       operations: validated,
       resource_hooks,
@@ -280,31 +246,30 @@ impl OhosBridgePlan {
 }
 
 fn validate_resource_hooks(
-  bridge: &BridgePlan,
+  family: &FamilyPlan,
   hooks: &OhosResourceHooks,
 ) -> Result<(), OhosEngineError> {
-  let needs_object = bridge.operations().iter().any(|operation| {
+  let needs_object = family.operations().iter().any(|operation| {
     operation
-      .required_capabilities
-      .contains(Capability::ObjectLease)
-      || matches!(
-        operation.operation.definition.source_key.owner(),
-        OperationOwner::Object(_)
-      ) && matches!(
-        operation.operation.definition.source_key.kind(),
-        OperationKind::Method | OperationKind::Constructor
-      )
+      .receiver
+      .as_ref()
+      .is_some_and(|receiver| receiver.kind == ResourceKind::Object)
+      || operation
+        .result
+        .is_some_and(|result| result.kind == ResourceKind::Object)
   });
-  let needs_output = bridge.operations().iter().any(|operation| {
+  let needs_output = family.operations().iter().any(|operation| {
     operation
-      .required_capabilities
-      .contains(Capability::OutputStream)
-      || matches!(
-        operation.operation.definition.source_key.kind(),
-        OperationKind::OutputStreamStart
-          | OperationKind::OutputStreamNext
-          | OperationKind::OutputStreamCancel
-      )
+      .receiver
+      .as_ref()
+      .is_some_and(|receiver| receiver.kind == ResourceKind::OutputStream)
+      || operation
+        .result
+        .is_some_and(|result| result.kind == ResourceKind::OutputStream)
+      || operation
+        .streams
+        .iter()
+        .any(|stream| stream.direction == StreamDirection::Output)
   });
   if needs_object && hooks.release_object.is_none() {
     return Err(OhosEngineError::MissingResourceHook {
@@ -324,168 +289,42 @@ fn validate_resource_hooks(
   Ok(())
 }
 
-fn validate_argument(
-  operation_id: OperationId,
-  index: usize,
-  value: &ValueType,
-  ownership: Ownership,
-  binding: &OhosArgumentBinding,
-  type_kinds: &BTreeMap<&uniffi_js_abi::TypeSourceKey, &uniffi_js_abi::NamedTypeKind>,
-) -> Result<(), OhosEngineError> {
-  let valid = match value {
-    ValueType::Scalar(ScalarType::I64) => matches!(binding, OhosArgumentBinding::I64BigInt),
-    ValueType::Scalar(ScalarType::U64) => matches!(binding, OhosArgumentBinding::U64BigInt),
-    ValueType::Scalar(
-      ScalarType::Bool
-      | ScalarType::I8
-      | ScalarType::U8
-      | ScalarType::I16
-      | ScalarType::U16
-      | ScalarType::I32
-      | ScalarType::U32
-      | ScalarType::F32
-      | ScalarType::F64
-      | ScalarType::String,
-    ) => matches!(
-      binding,
-      OhosArgumentBinding::Direct { .. } | OhosArgumentBinding::LowerWith { .. }
-    ),
-    ValueType::Named(key) => match type_kinds.get(key) {
-      Some(uniffi_js_abi::NamedTypeKind::Callback) => {
-        matches!(binding, OhosArgumentBinding::CallbackProxy { .. })
-      }
-      Some(uniffi_js_abi::NamedTypeKind::Object) => matches!(
-        binding,
-        OhosArgumentBinding::ObjectLease {
-          ownership: binding_ownership,
-          ..
-        } if *binding_ownership == ownership
-      ),
-      Some(_) => matches!(binding, OhosArgumentBinding::LowerWith { .. }),
-      None => false,
-    },
-    ValueType::InputStream(_) => matches!(binding, OhosArgumentBinding::InputStreamProxy { .. }),
-    ValueType::OutputStream(_) => false,
-    _ => matches!(binding, OhosArgumentBinding::LowerWith { .. }),
-  };
-  if valid {
-    Ok(())
-  } else {
-    Err(OhosEngineError::InvalidArgumentBinding {
-      operation_id,
-      argument: index,
-      expected: binding_expectation(value),
-    })
-  }
-}
-
-fn validate_return(
-  operation_id: OperationId,
-  value: Option<&ValueType>,
-  binding: &OhosReturnBinding,
-  type_kinds: &BTreeMap<&uniffi_js_abi::TypeSourceKey, &uniffi_js_abi::NamedTypeKind>,
-) -> Result<(), OhosEngineError> {
-  let valid = match value {
-    None => matches!(binding, OhosReturnBinding::Unit),
-    Some(ValueType::Scalar(ScalarType::I64)) => matches!(binding, OhosReturnBinding::I64BigInt),
-    Some(ValueType::Scalar(ScalarType::U64)) => matches!(binding, OhosReturnBinding::U64BigInt),
-    Some(ValueType::Scalar(
-      ScalarType::Bool
-      | ScalarType::I8
-      | ScalarType::U8
-      | ScalarType::I16
-      | ScalarType::U16
-      | ScalarType::I32
-      | ScalarType::U32
-      | ScalarType::F32
-      | ScalarType::F64
-      | ScalarType::String,
-    )) => matches!(
-      binding,
-      OhosReturnBinding::Direct { .. } | OhosReturnBinding::LiftWith { .. }
-    ),
-    Some(ValueType::Named(key)) => match type_kinds.get(key) {
-      Some(uniffi_js_abi::NamedTypeKind::Object) => {
-        matches!(binding, OhosReturnBinding::ObjectLease { .. })
-      }
-      Some(uniffi_js_abi::NamedTypeKind::Callback) => {
-        matches!(binding, OhosReturnBinding::CallbackLease { .. })
-      }
-      Some(_) => matches!(binding, OhosReturnBinding::LiftWith { .. }),
-      None => false,
-    },
-    Some(ValueType::OutputStream(_)) => {
-      matches!(binding, OhosReturnBinding::OutputStreamLease { .. })
-    }
-    Some(_) => matches!(binding, OhosReturnBinding::LiftWith { .. }),
-  };
-  if valid {
-    Ok(())
-  } else {
-    Err(OhosEngineError::InvalidReturnBinding {
-      operation_id,
-      expected: value.map_or("unit", binding_expectation),
-    })
-  }
-}
-
 fn validate_target(
-  kind: OperationKind,
+  family: &FamilyOperation,
   operation: &OhosOperationPlan,
 ) -> Result<(), OhosEngineError> {
-  let valid = match kind {
-    OperationKind::CallbackMethod => matches!(operation.target, OhosOperationTarget::CallbackHost),
-    OperationKind::InputStreamPull => {
-      matches!(operation.target, OhosOperationTarget::InputStreamHostPull)
+  let valid = match (family.target, &operation.target) {
+    (FamilyOperationTarget::Native, OhosOperationTarget::Native { .. }) => true,
+    (FamilyOperationTarget::CallbackHost { .. }, OhosOperationTarget::CallbackHost) => true,
+    (FamilyOperationTarget::InputStreamHostPull, OhosOperationTarget::InputStreamHostPull) => true,
+    (FamilyOperationTarget::InputStreamHostCancel, OhosOperationTarget::InputStreamHostCancel) => {
+      true
     }
-    OperationKind::InputStreamCancel => {
-      matches!(operation.target, OhosOperationTarget::InputStreamHostCancel)
-    }
-    _ => matches!(operation.target, OhosOperationTarget::Native { .. }),
+    _ => false,
   };
   if valid {
     Ok(())
   } else {
     Err(OhosEngineError::InvalidOperationTarget {
       operation_id: operation.operation_id,
-      kind,
+      kind: family.kind,
     })
   }
 }
 
 fn validate_receiver(
-  owner: &OperationOwner,
-  kind: OperationKind,
+  family: &FamilyOperation,
   operation: &OhosOperationPlan,
 ) -> Result<(), OhosEngineError> {
-  let required = matches!(
-    (owner, kind),
-    (OperationOwner::Object(_), OperationKind::Method)
-      | (OperationOwner::Object(_), OperationKind::OutputStreamNext)
-      | (OperationOwner::Object(_), OperationKind::OutputStreamCancel)
-  );
-  match (required, &operation.receiver) {
-    (false, None) => Ok(()),
-    (true, Some(receiver)) => {
-      let valid = if matches!(
-        kind,
-        OperationKind::OutputStreamNext | OperationKind::OutputStreamCancel
-      ) {
-        matches!(
-          receiver.binding,
-          OhosArgumentBinding::OutputStreamLease {
-            ownership: Ownership::Borrowed,
-            ..
-          }
-        )
-      } else {
-        matches!(
-          receiver.binding,
-          OhosArgumentBinding::ObjectLease {
-            ownership: Ownership::Borrowed,
-            ..
-          }
-        )
+  match (family.receiver.as_ref(), &operation.receiver) {
+    (None, None) => Ok(()),
+    (Some(expected), Some(actual)) => {
+      let valid = match (expected.kind, &actual.binding) {
+        (ResourceKind::Object, OhosArgumentBinding::ObjectLease { ownership, .. })
+        | (ResourceKind::OutputStream, OhosArgumentBinding::OutputStreamLease { ownership, .. }) => {
+          *ownership == expected.ownership
+        }
+        _ => false,
       };
       if valid {
         Ok(())
@@ -495,31 +334,75 @@ fn validate_receiver(
         })
       }
     }
-    (true, None) => Err(OhosEngineError::MissingObjectReceiver {
+    (Some(_), None) => Err(OhosEngineError::MissingObjectReceiver {
       operation_id: operation.operation_id,
     }),
-    (false, Some(_)) => Err(OhosEngineError::UnexpectedObjectReceiver {
+    (None, Some(_)) => Err(OhosEngineError::UnexpectedObjectReceiver {
       operation_id: operation.operation_id,
     }),
   }
 }
 
-fn binding_expectation(value: &ValueType) -> &'static str {
-  match value {
-    ValueType::Scalar(ScalarType::I64) => "lossless signed BigInt",
-    ValueType::Scalar(ScalarType::U64) => "lossless unsigned BigInt",
-    ValueType::Scalar(
-      ScalarType::Bool
-      | ScalarType::I8
-      | ScalarType::U8
-      | ScalarType::I16
-      | ScalarType::U16
-      | ScalarType::I32
-      | ScalarType::U32
-      | ScalarType::F32
-      | ScalarType::F64
-      | ScalarType::String,
-    ) => "direct Ark N-API carrier or explicit adapter",
-    _ => "explicit carrier adapter",
+fn validate_result_resource(
+  family: &FamilyOperation,
+  operation: &OhosOperationPlan,
+) -> Result<(), OhosEngineError> {
+  let valid = match family.result.map(|resource| resource.kind) {
+    None => !matches!(
+      operation.return_binding,
+      OhosReturnBinding::ObjectLease { .. } | OhosReturnBinding::OutputStreamLease { .. }
+    ),
+    Some(ResourceKind::Object) => matches!(
+      operation.return_binding,
+      OhosReturnBinding::ObjectLease { .. }
+    ),
+    Some(ResourceKind::OutputStream) => {
+      matches!(
+        operation.return_binding,
+        OhosReturnBinding::OutputStreamLease { .. }
+      )
+    }
+  };
+  if valid {
+    Ok(())
+  } else {
+    Err(OhosEngineError::InvalidResourceResult {
+      operation_id: operation.operation_id,
+    })
   }
+}
+
+fn validate_structured_bindings(
+  family: &FamilyOperation,
+  operation: &OhosOperationPlan,
+) -> Result<(), OhosEngineError> {
+  for (index, argument) in operation.arguments.iter().enumerate() {
+    let callback_path = family.callbacks.iter().any(|use_site| {
+      matches!(use_site.path.segments(), [ValuePathSegment::Argument(argument_index)] if *argument_index as usize == index)
+    });
+    if callback_path && !matches!(argument.binding, OhosArgumentBinding::CallbackProxy { .. }) {
+      return Err(OhosEngineError::InvalidStructuredBinding {
+        operation_id: operation.operation_id,
+        argument: index,
+        role: "callback",
+      });
+    }
+    let input_path = family.streams.iter().any(|use_site| {
+      use_site.direction == StreamDirection::Input
+        && matches!(use_site.path.segments(), [ValuePathSegment::Argument(argument_index)] if *argument_index as usize == index)
+    });
+    if input_path
+      && !matches!(
+        argument.binding,
+        OhosArgumentBinding::InputStreamProxy { .. }
+      )
+    {
+      return Err(OhosEngineError::InvalidStructuredBinding {
+        operation_id: operation.operation_id,
+        argument: index,
+        role: "input stream",
+      });
+    }
+  }
+  Ok(())
 }

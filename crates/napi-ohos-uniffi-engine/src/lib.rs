@@ -16,18 +16,14 @@ use std::sync::{Arc, Mutex};
 
 use napi_derive_backend_ohos::{NapiFn, NapiFnArg, NapiFnArgKind, NapiFnBuilder, TryToTokens};
 use napi_family_core::{
-  BigIntWords, CarrierRecipe, FamilyOperation, FamilyOperationTarget, FamilyPlan, FamilyPlanError,
-  HostFlavor,
+  AsyncKind, BigIntWords, CallbackReentrancy, CallbackRetention, CallbackThreading,
+  FamilyOperation, FamilyOperationTarget, FamilyPlan, FamilyPlanError, OperationKind,
+  StreamDirection, ValuePathSegment,
 };
 use napi_ohos::bindgen_prelude::{BigInt, ToNapiValue};
 use napi_ohos::{sys, Result as NapiResult};
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
-use uniffi_js_abi::{AsyncKind, OperationId, OperationKind};
-use uniffi_js_engine_schema::{
-  BridgePlan, CallbackReentrancy, CallbackRetention, CallbackThreading, StreamDirection,
-  ValuePathSegment,
-};
 
 pub use napi_family_core;
 mod plan;
@@ -327,17 +323,9 @@ type OhosFuture<'a> = Pin<Box<dyn Future<Output = Result<OhosValue, OhosError>> 
 /// The engine never stores an Ark `napi_env` in its plan and never fabricates
 /// public declarations for these operations.
 pub trait OhosHost: Send + 'static {
-  fn invoke_sync(
-    &mut self,
-    operation_id: OperationId,
-    args: &[OhosValue],
-  ) -> Result<OhosValue, OhosError>;
+  fn invoke_sync(&mut self, operation_id: u32, args: &[OhosValue]) -> Result<OhosValue, OhosError>;
 
-  fn invoke_async<'a>(
-    &'a mut self,
-    operation_id: OperationId,
-    args: Vec<OhosValue>,
-  ) -> OhosFuture<'a>;
+  fn invoke_async<'a>(&'a mut self, operation_id: u32, args: Vec<OhosValue>) -> OhosFuture<'a>;
 
   fn invoke_callback(
     &mut self,
@@ -424,16 +412,15 @@ impl GeneratedOhosModule {
       .rust
       .operations()
       .iter()
-      .map(|operation| format!("__uniffi_raw_operation_{}", operation.operation_id.index()))
+      .map(|operation| format!("__uniffi_raw_operation_{}", operation.operation_id))
   }
 }
 
 /// Build one OHOS engine module from frozen bridge and Rust operation plans.
 pub fn generate_ohos_module(
-  bridge: &BridgePlan,
+  family: &FamilyPlan,
   rust: OhosBridgePlan,
 ) -> Result<GeneratedOhosModule, OhosEngineError> {
-  let family = FamilyPlan::build(bridge, HostFlavor::Ohos).map_err(OhosEngineError::FamilyPlan)?;
   if family.operations().len() != rust.operations().len() {
     return Err(OhosEngineError::OperationCount {
       expected: family.operations().len(),
@@ -441,7 +428,7 @@ pub fn generate_ohos_module(
     });
   }
   Ok(GeneratedOhosModule {
-    family,
+    family: family.clone(),
     hooks: OhosRuntimeHooks::default(),
     rust,
   })
@@ -451,10 +438,10 @@ pub fn generate_ohos_module(
 /// AST/codegen used by `#[napi]`.  The factory body intentionally forwards the
 /// host object to the concrete adapter; no public raw operation is emitted.
 pub fn generate_ohos_source(
-  bridge: &BridgePlan,
+  family: &FamilyPlan,
   rust: OhosBridgePlan,
 ) -> Result<GeneratedOhosSource, OhosEngineError> {
-  let module = generate_ohos_module(bridge, rust)?;
+  let module = generate_ohos_module(family, rust)?;
   let mut source = TokenStream::new();
   let mut callbacks = Vec::with_capacity(module.operations().len());
 
@@ -462,8 +449,8 @@ pub fn generate_ohos_source(
   {
     if family_operation.id != operation.operation_id {
       return Err(OhosEngineError::NonDenseOperation {
-        expected: family_operation.id.index(),
-        actual: operation.operation_id.index(),
+        expected: family_operation.id,
+        actual: operation.operation_id,
       });
     }
     if family_operation.target == FamilyOperationTarget::Native {
@@ -559,7 +546,7 @@ fn generate_operation(
       kind: family.kind,
     });
   };
-  let id = operation.operation_id.index();
+  let id = operation.operation_id;
   let function_name = format_ident!("__uniffi_raw_operation_{id}");
   let callback_factory = format_ident!("_napi_rs_internal_register___uniffi_raw_operation_{id}");
   let register_name = format_ident!("__napi_register_uniffi_raw_operation_{id}");
@@ -669,7 +656,7 @@ fn generate_operation(
             argument: argument_index,
             role: "callback",
           })?;
-        let callback_type_id = callback.callback_type.index();
+        let callback_type_id = callback.callback_type_id;
         let contract = callback_contract_tokens(callback, argument_index as u32);
         let wrapper_arg = Ident::new(
           &format!("arg{}", first_operation_arg + argument_index),
@@ -686,7 +673,7 @@ fn generate_operation(
       }
       OhosArgumentBinding::InputStreamProxy { build, .. } => {
         let found = family.streams.iter().any(|use_site| {
-          use_site.contract.direction == StreamDirection::Input
+          use_site.direction == StreamDirection::Input
             && matches!(
               use_site.path.segments(),
               [ValuePathSegment::Argument(index)] if *index as usize == argument_index
@@ -786,10 +773,10 @@ fn generate_operation(
 }
 
 fn callback_contract_tokens(
-  callback: &napi_family_core::FamilyCallbackUseSite,
+  callback: &napi_family_core::CallbackUseSite,
   argument_index: u32,
 ) -> TokenStream {
-  let callback_type_id = callback.callback_type.index();
+  let callback_type_id = callback.callback_type_id;
   let retention = match callback.contract.retention {
     CallbackRetention::Scoped => {
       quote!(napi_ohos_uniffi_engine::SessionCallbackRetention::Scoped)
@@ -921,10 +908,11 @@ fn session_descriptor_tokens(
       AsyncKind::Sync => quote!(napi_ohos_uniffi_engine::SessionOperationDispatch::NativeSync),
       AsyncKind::Async => quote!(napi_ohos_uniffi_engine::SessionOperationDispatch::NativeAsync),
     },
-    FamilyOperationTarget::CallbackHost(method) => {
-      let callback_type_id = method.callback_type.index();
-      let method_id = method.method_id;
-      let error_style = if family_operation.declared_error.is_some() {
+    FamilyOperationTarget::CallbackHost {
+      callback_type_id,
+      method_id,
+    } => {
+      let error_style = if family_operation.fallible {
         quote!(napi_ohos_uniffi_engine::SessionCallbackErrorStyle::Fallible)
       } else {
         quote!(napi_ohos_uniffi_engine::SessionCallbackErrorStyle::Infallible)
@@ -1017,7 +1005,7 @@ fn session_descriptor_tokens(
           use_site.path
         )));
       };
-      let callback_type_id = use_site.callback_type.index();
+      let callback_type_id = use_site.callback_type_id;
       let retention = match use_site.contract.retention {
         CallbackRetention::Scoped => {
           quote!(napi_ohos_uniffi_engine::SessionCallbackRetention::Scoped)
@@ -1056,7 +1044,7 @@ fn session_descriptor_tokens(
   let stream_arguments = family_operation
     .streams
     .iter()
-    .filter(|use_site| use_site.contract.direction == StreamDirection::Input)
+    .filter(|use_site| use_site.direction == StreamDirection::Input)
     .map(|use_site| {
       let [ValuePathSegment::Argument(argument_index)] = use_site.path.segments() else {
         return Err(OhosEngineError::Codegen(format!(
@@ -1103,12 +1091,13 @@ fn operation_receiver(
 fn operation_result_receiver(
   operation: &napi_family_core::FamilyOperation,
 ) -> Option<SessionResourceReceiver> {
-  match operation.return_value.as_ref() {
-    Some(CarrierRecipe::ObjectLease(_)) => Some(SessionResourceReceiver::Object),
-    Some(CarrierRecipe::OutputStream(_)) => Some(SessionResourceReceiver::OutputStream),
+  match operation.result.map(|resource| resource.kind) {
+    Some(napi_family_core::ResourceKind::Object) => Some(SessionResourceReceiver::Object),
+    Some(napi_family_core::ResourceKind::OutputStream) => {
+      Some(SessionResourceReceiver::OutputStream)
+    }
     _ => operation.streams.iter().find_map(|stream| {
-      (stream.contract.direction == StreamDirection::Output)
-        .then_some(SessionResourceReceiver::OutputStream)
+      (stream.direction == StreamDirection::Output).then_some(SessionResourceReceiver::OutputStream)
     }),
   }
 }
@@ -1128,47 +1117,55 @@ pub enum OhosEngineError {
     id: u32,
   },
   ArgumentCount {
-    operation_id: OperationId,
+    operation_id: u32,
     expected: usize,
     actual: usize,
   },
   DuplicateRustArgument {
-    operation_id: OperationId,
+    operation_id: u32,
     name: String,
   },
   InvalidArgumentBinding {
-    operation_id: OperationId,
+    operation_id: u32,
     argument: usize,
     expected: &'static str,
   },
   InvalidReturnBinding {
-    operation_id: OperationId,
+    operation_id: u32,
     expected: &'static str,
   },
+  InvalidResourceResult {
+    operation_id: u32,
+  },
+  InvalidStructuredBinding {
+    operation_id: u32,
+    argument: usize,
+    role: &'static str,
+  },
   MissingErrorDescriptor {
-    operation_id: OperationId,
+    operation_id: u32,
   },
   UnexpectedErrorDescriptor {
-    operation_id: OperationId,
+    operation_id: u32,
   },
   InvalidOperationTarget {
-    operation_id: OperationId,
+    operation_id: u32,
     kind: OperationKind,
   },
   HostOperationHasRustBindings {
-    operation_id: OperationId,
+    operation_id: u32,
   },
   MissingObjectReceiver {
-    operation_id: OperationId,
+    operation_id: u32,
   },
   UnexpectedObjectReceiver {
-    operation_id: OperationId,
+    operation_id: u32,
   },
   InvalidObjectReceiver {
-    operation_id: OperationId,
+    operation_id: u32,
   },
   MissingStructuredUseSite {
-    operation_id: OperationId,
+    operation_id: u32,
     argument: usize,
     role: &'static str,
   },
@@ -1180,10 +1177,10 @@ pub enum OhosEngineError {
     actual: u32,
   },
   DispatchMismatch {
-    operation_id: OperationId,
+    operation_id: u32,
   },
   UnknownOperation {
-    operation_id: OperationId,
+    operation_id: u32,
   },
   Closed,
   Host(OhosError),
@@ -1236,6 +1233,18 @@ impl fmt::Display for OhosEngineError {
       } => write!(
         formatter,
         "operation {operation_id} return requires {expected}"
+      ),
+      Self::InvalidResourceResult { operation_id } => write!(
+        formatter,
+        "operation {operation_id} has an incompatible resource result binding"
+      ),
+      Self::InvalidStructuredBinding {
+        operation_id,
+        argument,
+        role,
+      } => write!(
+        formatter,
+        "operation {operation_id} argument {argument} requires a structured {role} binding"
       ),
       Self::MissingErrorDescriptor { operation_id } => write!(
         formatter,
@@ -1349,7 +1358,7 @@ impl<H: OhosHost> OhosBackendSession<H> {
 
   pub fn invoke_sync(
     &self,
-    operation_id: OperationId,
+    operation_id: u32,
     args: &[OhosValue],
   ) -> Result<OhosValue, OhosEngineError> {
     self.ensure_open()?;
@@ -1367,14 +1376,17 @@ impl<H: OhosHost> OhosBackendSession<H> {
         .map_err(|_| OhosError::new("OHOS host mutex poisoned"))?
         .invoke_sync(operation_id, args)
         .map_err(Into::into),
-      FamilyOperationTarget::CallbackHost(method) => {
+      FamilyOperationTarget::CallbackHost {
+        callback_type_id,
+        method_id,
+      } => {
         let callback = callback_id(args)?;
         self.invoke_callback_guarded(
-          method.callback_type.index(),
+          callback_type_id,
           callback,
-          method.method_id,
+          method_id,
           args,
-          self.callback_reentrancy_for_method(operation, method.callback_type.index()),
+          self.callback_reentrancy_for_method(operation, callback_type_id),
         )
       }
       FamilyOperationTarget::InputStreamHostPull => {
@@ -1405,7 +1417,7 @@ impl<H: OhosHost> OhosBackendSession<H> {
 
   pub fn invoke_async(
     &self,
-    operation_id: OperationId,
+    operation_id: u32,
     args: Vec<OhosValue>,
   ) -> Result<OhosFuture<'static>, OhosEngineError> {
     self.ensure_open()?;
@@ -1420,26 +1432,25 @@ impl<H: OhosHost> OhosBackendSession<H> {
     let state = Arc::clone(&self.state);
     let target = operation.target;
     let callback_guard = match target {
-      FamilyOperationTarget::CallbackHost(method) => {
+      FamilyOperationTarget::CallbackHost {
+        callback_type_id,
+        method_id: _method_id,
+      } => {
         let callback = callback_id(&args)?;
-        let reentrancy =
-          self.callback_reentrancy_for_method(operation, method.callback_type.index());
+        let reentrancy = self.callback_reentrancy_for_method(operation, callback_type_id);
         if reentrancy == CallbackReentrancy::Forbidden {
           let mut locked = self
             .state
             .lock()
             .map_err(|_| OhosError::new("OHOS session mutex poisoned"))?;
-          if !locked
-            .active_callbacks
-            .insert((method.callback_type.index(), callback))
-          {
+          if !locked.active_callbacks.insert((callback_type_id, callback)) {
             return Err(OhosEngineError::ReentrancyForbidden {
-              callback_type: method.callback_type.index(),
+              callback_type: callback_type_id,
               callback_id: callback,
             });
           }
         }
-        Some((method.callback_type.index(), callback, reentrancy))
+        Some((callback_type_id, callback, reentrancy))
       }
       _ => None,
     };
@@ -1467,19 +1478,17 @@ impl<H: OhosHost> OhosBackendSession<H> {
             .cancel_input_stream(stream)
             .map(|_| OhosValue::Unit)
         }
-        FamilyOperationTarget::CallbackHost(method) => {
+        FamilyOperationTarget::CallbackHost {
+          callback_type_id,
+          method_id,
+        } => {
           // Async callbacks are dispatched by the Ark priority TSFN.  The
           // session guard remains authoritative for reentrancy.
           let callback = callback_id(&args).map_err(|error| OhosError::new(error.to_string()))?;
           host
             .lock()
             .map_err(|_| OhosError::new("OHOS host mutex poisoned"))?
-            .invoke_callback(
-              method.callback_type.index(),
-              callback,
-              method.method_id,
-              &args,
-            )
+            .invoke_callback(callback_type_id, callback, method_id, &args)
         }
       };
       if let Ok(value) = &result {
@@ -1757,7 +1766,7 @@ impl<H: OhosHost> OhosBackendSession<H> {
 
   fn operation(
     &self,
-    operation_id: OperationId,
+    operation_id: u32,
   ) -> Result<&napi_family_core::FamilyOperation, OhosEngineError> {
     self
       .family
@@ -1773,7 +1782,7 @@ impl<H: OhosHost> OhosBackendSession<H> {
       .operations()
       .iter()
       .flat_map(|operation| operation.callbacks.iter())
-      .filter(|use_site| use_site.callback_type.index() == callback_type_id)
+      .filter(|use_site| use_site.callback_type_id == callback_type_id)
       .map(|use_site| use_site.contract.reentrancy)
       .find(|policy| *policy == CallbackReentrancy::Forbidden)
       .unwrap_or(CallbackReentrancy::Allowed)
@@ -1793,7 +1802,7 @@ impl<H: OhosHost> OhosBackendSession<H> {
     let operation_policy = operation
       .callbacks
       .iter()
-      .filter(|use_site| use_site.callback_type.index() == callback_type_id)
+      .filter(|use_site| use_site.callback_type_id == callback_type_id)
       .map(|use_site| use_site.contract.reentrancy)
       .find(|policy| *policy == CallbackReentrancy::Forbidden);
     if operation_policy.is_some() {
@@ -1802,7 +1811,7 @@ impl<H: OhosHost> OhosBackendSession<H> {
     if operation
       .callbacks
       .iter()
-      .any(|use_site| use_site.callback_type.index() == callback_type_id)
+      .any(|use_site| use_site.callback_type_id == callback_type_id)
     {
       return CallbackReentrancy::Allowed;
     }
@@ -1811,7 +1820,7 @@ impl<H: OhosHost> OhosBackendSession<H> {
       .operations()
       .iter()
       .flat_map(|candidate| candidate.callbacks.iter())
-      .filter(|use_site| use_site.callback_type.index() == callback_type_id)
+      .filter(|use_site| use_site.callback_type_id == callback_type_id)
       .map(|use_site| use_site.contract.reentrancy)
       .find(|policy| *policy == CallbackReentrancy::Forbidden)
       .unwrap_or(CallbackReentrancy::Allowed)
@@ -1828,7 +1837,7 @@ impl<H: OhosHost> OhosBackendSession<H> {
       .lock()
       .map_err(|_| OhosError::new("OHOS session mutex poisoned"))?;
     for stream in &operation.streams {
-      if stream.contract.direction != StreamDirection::Input {
+      if stream.direction != StreamDirection::Input {
         continue;
       }
       let Some(value) = args.get(receiver_offset) else {
@@ -1862,11 +1871,11 @@ impl<H: OhosHost> OhosBackendSession<H> {
       .state
       .lock()
       .map_err(|_| OhosError::new("OHOS session mutex poisoned"))?;
-    match (operation.return_value.as_ref(), value) {
-      (Some(napi_family_core::CarrierRecipe::ObjectLease(_)), OhosValue::Object(id)) => {
+    match (operation.result.map(|resource| resource.kind), value) {
+      (Some(napi_family_core::ResourceKind::Object), OhosValue::Object(id)) => {
         state.objects.insert(*id);
       }
-      (Some(napi_family_core::CarrierRecipe::OutputStream(_)), OhosValue::OutputStream(id)) => {
+      (Some(napi_family_core::ResourceKind::OutputStream), OhosValue::OutputStream(id)) => {
         state.output_streams.insert(*id);
         state.cancelled_output_streams.remove(id);
       }

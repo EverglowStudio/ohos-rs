@@ -8,6 +8,11 @@ pub fn cli_build() -> impl Parser<crate::Options> {
     .help("The path of the final build product is set to `dist` by default.")
     .fallback(String::from("dist"));
 
+  let public_facade_dir = long("public-facade-dir")
+    .help("Copy the UniFFI public ArkTS facade (Index.ets and Index.d.ets) into the package dist directory.")
+    .argument::<String>("DIR")
+    .optional();
+
   let release = long("release")
     .help("Build with release mode.")
     .flag(true, false);
@@ -84,6 +89,7 @@ pub fn cli_build() -> impl Parser<crate::Options> {
 
   let init_parser = construct!(crate::BuildArgs {
     dist,
+    public_facade_dir,
     arch,
     release,
     copy_static,

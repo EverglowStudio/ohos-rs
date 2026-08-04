@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 mod abort_tmp;
 mod artifact;
 pub(crate) mod atomic;
+mod facade;
 mod prepare;
 mod run;
 mod stream_tmp;
@@ -35,6 +36,8 @@ pub struct Context<'a> {
   pub mode: &'a str,
   // Target artifact path
   pub dist: PathBuf,
+  /// Optional, validated source directory for the UniFFI public ArkTS facade.
+  pub public_facade_dir: Option<PathBuf>,
   // Build information
   pub package: Option<Package>,
 
@@ -143,6 +146,11 @@ pub fn build(args: crate::BuildArgs) -> anyhow::Result<()> {
         // Otherwise, ctx.dist is already in a package directory, no need to modify
       }
     }
+
+    if let Some(source_dir) = package_ctx.public_facade_dir.clone() {
+      let facade = facade::PublicFacade::from_dir(source_dir)?;
+      facade.validate_destination(&package_ctx.dist)?;
+    }
     // If executing in a package directory (packages_to_build.len() == 1), dist has already been correctly set in prepare, no need to modify
 
     let target_dir = current_args.target_dir.to_owned().unwrap_or(
@@ -204,6 +212,11 @@ pub fn build(args: crate::BuildArgs) -> anyhow::Result<()> {
       .collect::<anyhow::Result<Vec<_>>>()?;
 
     ts::generate_d_ts_file(&package_ctx)?;
+
+    if let Some(source_dir) = package_ctx.public_facade_dir.clone() {
+      let facade = facade::PublicFacade::from_dir(source_dir)?;
+      facade.copy_to(&package_ctx.dist)?;
+    }
   }
 
   Ok(())

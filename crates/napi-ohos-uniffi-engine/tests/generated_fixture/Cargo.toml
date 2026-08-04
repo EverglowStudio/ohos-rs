@@ -1,0 +1,25 @@
+[package]
+name = "napi-ohos-uniffi-generated-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# This fixture is an independent Cargo package.  It is invoked explicitly by
+# the OHOS cross-target gate and must not become another workspace member.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+napi-ohos = { path = "../../../napi", version = "=1.2.0", default-features = false, features = ["napi8", "async"] }
+napi-ohos-uniffi-engine = { path = "../..", version = "=0.1.0" }
+
+[build-dependencies]
+napi-build-ohos = { path = "../../../build", version = "=1.2.0" }
+napi-ohos-uniffi-engine = { path = "../..", version = "=0.1.0" }
+proc-macro2 = "1"
+syn = { version = "2", features = ["full"] }
+uniffi_js_abi = { git = "https://github.com/EverglowStudio/uniffi-rs.git", rev = "c87db9d984da6c065490dda864bdd13c6ab59f0b", version = "=0.32.0" }
+uniffi_js_engine_schema = { git = "https://github.com/EverglowStudio/uniffi-rs.git", rev = "c87db9d984da6c065490dda864bdd13c6ab59f0b", version = "=0.32.0" }

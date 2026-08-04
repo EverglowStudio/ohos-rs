@@ -1012,6 +1012,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "napi-family-core"
+version = "0.1.0"
+source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=6fdf482d26efd06d3cf2d49e164549a1387a6f91#6fdf482d26efd06d3cf2d49e164549a1387a6f91"
+dependencies = [
+ "uniffi_js_abi",
+ "uniffi_js_engine_schema",
+]
+
+[[package]]
 name = "napi-ohos"
 version = "1.2.0"
 dependencies = [
@@ -1032,6 +1041,21 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+]
+
+[[package]]
+name = "napi-ohos-uniffi-engine"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "napi-derive-backend-ohos",
+ "napi-family-core",
+ "napi-ohos",
+ "proc-macro2",
+ "quote",
+ "syn",
+ "uniffi_js_abi",
+ "uniffi_js_engine_schema",
 ]
 
 [[package]]
@@ -1985,6 +2009,19 @@ name = "unicode-segmentation"
 version = "1.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9629274872b2bfaf8d66f5f15725007f635594914870f65218920345aa11aa8c"
+
+[[package]]
+name = "uniffi_js_abi"
+version = "0.32.0"
+source = "git+https://github.com/EverglowStudio/uniffi-rs.git?rev=c87db9d984da6c065490dda864bdd13c6ab59f0b#c87db9d984da6c065490dda864bdd13c6ab59f0b"
+
+[[package]]
+name = "uniffi_js_engine_schema"
+version = "0.32.0"
+source = "git+https://github.com/EverglowStudio/uniffi-rs.git?rev=c87db9d984da6c065490dda864bdd13c6ab59f0b#c87db9d984da6c065490dda864bdd13c6ab59f0b"
+dependencies = [
+ "uniffi_js_abi",
+]
 
 [[package]]
 name = "untrusted"

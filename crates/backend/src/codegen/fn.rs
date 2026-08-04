@@ -38,6 +38,13 @@ impl TryToTokens for NapiFn {
       mut_ref_spans,
       unsafe_,
     } = self.gen_arg_conversions()?;
+    if self.leading_wrapper_args > arg_names.len() {
+      return Err(Diagnostic::span_error(
+        self.name.span(),
+        "leading wrapper argument count exceeds decoded arguments",
+      ));
+    }
+    let call_arg_names = &arg_names[self.leading_wrapper_args..];
     let attrs = &self.attrs;
     let arg_ref_count = refs.len();
     let receiver = self.gen_fn_receiver();
@@ -45,6 +52,7 @@ impl TryToTokens for NapiFn {
     let ret = self.gen_fn_return(&receiver_ret_name)?;
     let register = self.gen_fn_register();
     let tracing_debug = gen_tracing_debug(&self.js_name, self.parent_js_name.as_ref());
+    let pre_call = &self.pre_call;
 
     if self.module_exports {
       (quote! {
@@ -59,8 +67,9 @@ impl TryToTokens for NapiFn {
           #tracing_debug
           let __wrapped_env = napi_ohos::bindgen_prelude::Env::from(env);
           #(#arg_conversions)*
+          #pre_call
           let #receiver_ret_name = {
-            #receiver(#(#arg_names),*)
+            #receiver(#(#call_arg_names),*)
           };
           #ret
         }
@@ -140,7 +149,7 @@ impl TryToTokens for NapiFn {
         quote! {
           napi_ohos::bindgen_prelude::within_runtime_if_available(move || {
             let #receiver_ret_name = {
-              #receiver(#(#arg_names),*)
+              #receiver(#(#call_arg_names),*)
             };
             #ret
           })
@@ -148,21 +157,21 @@ impl TryToTokens for NapiFn {
       } else {
         quote! {
           let #receiver_ret_name = {
-            #receiver(#(#arg_names),*)
+            #receiver(#(#call_arg_names),*)
           };
           #ret
         }
       }
     } else {
       let call = if self.is_ret_result {
-        quote! { #receiver(#(#arg_names),*).await }
+        quote! { #receiver(#(#call_arg_names),*).await }
       } else {
         let ret_type = if let Some(t) = &self.ret {
           quote! { #t }
         } else {
           quote! { () }
         };
-        quote! { Ok::<#ret_type, napi_ohos::Error>(#receiver(#(#arg_names),*).await) }
+        quote! { Ok::<#ret_type, napi_ohos::Error>(#receiver(#(#call_arg_names),*).await) }
       };
       quote! {
         napi_ohos::bindgen_prelude::execute_tokio_future_with_finalize_callback(env, async move { #call }, move |env, #receiver_ret_name| {
@@ -185,6 +194,7 @@ impl TryToTokens for NapiFn {
           let __wrapped_env = napi_ohos::bindgen_prelude::Env::from(env);
           #build_ref_container
           #(#arg_conversions)*
+          #pre_call
           #native_call
         })
     };
@@ -194,6 +204,7 @@ impl TryToTokens for NapiFn {
       && self.kind != FnKind::Constructor
       && self.kind != FnKind::Factory
       && !self.is_async
+      && self.pre_call.is_empty()
     {
       quote! { #native_call }
     } else if self.kind == FnKind::Constructor {
@@ -443,9 +454,18 @@ impl NapiFn {
     path: &syn::PatType,
   ) -> BindgenResult<(TokenStream, NapiArgType)> {
     let mut ty = *path.ty.clone();
+    // A module-initializer callback receives the exports value directly;
+    // ordinary functions receive their arguments through CallbackInfo.  Keep
+    // this source expression in one place so validation and conversion never
+    // accidentally refer to the ordinary `cb` binding from an initializer.
+    let arg_value = if self.module_exports {
+      quote! { _napi_module_exports_ }
+    } else {
+      quote! { cb.get_arg(#index) }
+    };
     let type_check = if self.return_if_invalid {
       quote! {
-        if let Ok(maybe_promise) = <#ty as napi_ohos::bindgen_prelude::ValidateNapiValue>::validate(env, cb.get_arg(#index)) {
+        if let Ok(maybe_promise) = <#ty as napi_ohos::bindgen_prelude::ValidateNapiValue>::validate(env, #arg_value) {
           if !maybe_promise.is_null() {
             return Ok(maybe_promise);
           }
@@ -455,7 +475,7 @@ impl NapiFn {
       }
     } else if self.strict {
       quote! {
-        let maybe_promise = <#ty as napi_ohos::bindgen_prelude::ValidateNapiValue>::validate(env, cb.get_arg(#index))?;
+        let maybe_promise = <#ty as napi_ohos::bindgen_prelude::ValidateNapiValue>::validate(env, #arg_value)?;
         if !maybe_promise.is_null() {
           return Ok(maybe_promise);
         }
@@ -464,11 +484,7 @@ impl NapiFn {
       quote! {}
     };
 
-    let arg_conversion = if self.module_exports {
-      quote! { _napi_module_exports_ }
-    } else {
-      quote! { cb.get_arg(#index) }
-    };
+    let arg_conversion = arg_value.clone();
 
     match ty {
       syn::Type::Reference(syn::TypeReference {
@@ -479,7 +495,7 @@ impl NapiFn {
         let q = quote! {
           let #arg_name = {
             #type_check
-            <#elem as napi_ohos::bindgen_prelude::FromNapiMutRef>::from_napi_mut_ref(env, cb.get_arg(#index))?
+            <#elem as napi_ohos::bindgen_prelude::FromNapiMutRef>::from_napi_mut_ref(env, #arg_value)?
           };
         };
         Ok((q, NapiArgType::MutRef))
@@ -494,7 +510,7 @@ impl NapiFn {
                 let q = quote! {
                   let #arg_name = {
                     #type_check
-                    <&mut #elem as napi_ohos::bindgen_prelude::FromNapiValue>::from_napi_value(env, cb.get_arg(#index))?
+                    <&mut #elem as napi_ohos::bindgen_prelude::FromNapiValue>::from_napi_value(env, #arg_value)?
                   };
                 };
                 return Ok((q, NapiArgType::Ref));
@@ -506,7 +522,7 @@ impl NapiFn {
           quote! {
             let #arg_name = {
               #type_check
-              <#elem as napi_ohos::bindgen_prelude::FromNapiMutRef>::from_napi_mut_ref(env, cb.get_arg(#index))?
+              <#elem as napi_ohos::bindgen_prelude::FromNapiMutRef>::from_napi_mut_ref(env, #arg_value)?
             }
           }
         } else {
@@ -525,7 +541,7 @@ impl NapiFn {
           quote! {
             let #arg_name = {
               #type_check
-              <#elem as napi_ohos::bindgen_prelude::FromNapiRef>::from_napi_ref(env, cb.get_arg(#index))?
+              <#elem as napi_ohos::bindgen_prelude::FromNapiRef>::from_napi_ref(env, #arg_value)?
             };
           }
         };

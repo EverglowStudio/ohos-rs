@@ -1,3 +1,4 @@
+use crate::build::facade::{validate_workspace_selection, PublicFacade};
 use crate::build::{get_hos_sdk, Context, Template};
 use crate::create_dist_dir;
 use anyhow::Error;
@@ -83,6 +84,20 @@ pub fn prepare(args: &mut crate::BuildArgs, ctx: &mut Context) -> anyhow::Result
   } else {
     None
   };
+
+  let public_facade = args
+    .public_facade_dir
+    .as_deref()
+    .map(PathBuf::from)
+    .map(|path| {
+      let path = if path.is_absolute() {
+        path
+      } else {
+        ctx.pwd.join(path)
+      };
+      PublicFacade::from_dir(path)
+    })
+    .transpose()?;
 
   let cargo_file = ctx.pwd.join("./Cargo.toml");
   let cargo_file_str = cargo_file.to_str().unwrap_or_default();
@@ -175,6 +190,24 @@ pub fn prepare(args: &mut crate::BuildArgs, ctx: &mut Context) -> anyhow::Result
   if packages_to_build.is_empty() {
     return Err(Error::msg("No package need to build."));
   }
+
+  // `build` applies the same package filter before executing cargo.  Treat an
+  // explicit filter as one selected package here so a facade can be used from
+  // a workspace root without being ambiguously copied to every member.
+  let package_filter_is_explicit = args.package.is_some()
+    || args
+      .cargo_args
+      .as_deref()
+      .unwrap_or_default()
+      .windows(2)
+      .any(|pair| pair[0] == "-p" || pair[0] == "--package");
+  let selected_package_count = if package_filter_is_explicit {
+    1
+  } else {
+    packages_to_build.len()
+  };
+  validate_workspace_selection(public_facade.as_ref(), selected_package_count)?;
+  ctx.public_facade_dir = public_facade.map(|facade| facade.source_dir().to_path_buf());
 
   let pkg = packages_to_build[0];
 

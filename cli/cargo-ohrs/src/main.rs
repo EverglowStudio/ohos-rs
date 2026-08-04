@@ -21,6 +21,7 @@ pub(crate) struct InitArgs {
 #[derive(Debug, Clone)]
 pub(crate) struct BuildArgs {
   dist: String,
+  public_facade_dir: Option<String>,
   arch: Option<Vec<Arch>>,
   release: bool,
   copy_static: bool,

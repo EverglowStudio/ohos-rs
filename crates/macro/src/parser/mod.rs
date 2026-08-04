@@ -893,6 +893,8 @@ fn napi_fn_from_decl(
       unsafe_: sig.unsafety.is_some(),
       register_name: get_register_ident(ident.to_string().as_str()),
       no_export: opts.no_export().is_some(),
+      pre_call: TokenStream::new(),
+      leading_wrapper_args: 0,
     })
   })
 }

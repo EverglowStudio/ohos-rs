@@ -248,8 +248,9 @@ impl<'env, T: FromNapiValue> PromiseRaw<'env, T> {
       sys::napi_get_named_property(self.env, self.inner, FINALLY.as_ptr().cast(), &mut then_fn)
     })?;
     let mut then_callback = ptr::null_mut();
-    let rust_cb = Box::into_raw(Box::new(cb));
-    check_status!(
+    let executed = Box::into_raw(Box::new(false));
+    let rust_cb = Box::into_raw(Box::new((cb, executed)));
+    let create_result = check_status!(
       unsafe {
         sys::napi_create_function(
           self.env,
@@ -261,7 +262,33 @@ impl<'env, T: FromNapiValue> PromiseRaw<'env, T> {
         )
       },
       "Create then function for PromiseRaw failed"
-    )?;
+    );
+    if let Err(error) = create_result {
+      drop(unsafe { Box::from_raw(rust_cb) });
+      drop(unsafe { Box::from_raw(executed) });
+      return Err(error);
+    }
+    // Attach ownership before handing the callback to user-overridable
+    // JavaScript. A custom `finally` may retain the callback and then throw;
+    // this finalizer still owns the Rust closure in that path.
+    let wrap_result = check_status!(
+      unsafe {
+        sys::napi_wrap(
+          self.env,
+          then_callback,
+          executed.cast(),
+          Some(promise_finally_callback_finalizer::<U, Callback>),
+          rust_cb.cast(),
+          ptr::null_mut(),
+        )
+      },
+      "Wrap finalizer for PromiseRaw::finally failed"
+    );
+    if let Err(error) = wrap_result {
+      drop(unsafe { Box::from_raw(rust_cb) });
+      drop(unsafe { Box::from_raw(executed) });
+      return Err(error);
+    }
     let mut new_promise = ptr::null_mut();
     check_status!(
       unsafe {
@@ -486,9 +513,11 @@ where
     },
     "Get callback info from finally callback failed"
   )?;
-  let cb: Box<Cb> = unsafe { Box::from_raw(rust_cb.cast()) };
+  let cb: Box<(Cb, *mut bool)> = unsafe { Box::from_raw(rust_cb.cast()) };
+  let executed = unsafe { Box::leak(Box::from_raw(cb.1)) };
+  *executed = true;
 
-  unsafe { U::to_napi_value(env, cb(Env(env))?) }
+  unsafe { U::to_napi_value(env, cb.0(Env(env))?) }
 }
 
 pub struct CallbackContext<T> {
@@ -553,6 +582,20 @@ extern "C" fn promise_callback_finalizer<T, U, Cb>(
   let executed = unsafe { Box::from_raw(finalize_data.cast::<bool>()) };
   if !*executed {
     // Callback was never executed, clean up the rust_cb which contains (Cb, *mut bool)
+    drop(unsafe { Box::from_raw(finalize_hint.cast::<(Cb, *mut bool)>()) });
+  }
+}
+
+extern "C" fn promise_finally_callback_finalizer<U, Cb>(
+  _env: sys::napi_env,
+  finalize_data: *mut c_void,
+  finalize_hint: *mut c_void,
+) where
+  U: ToNapiValue,
+  Cb: FnOnce(Env) -> Result<U>,
+{
+  let executed = unsafe { Box::from_raw(finalize_data.cast::<bool>()) };
+  if !*executed {
     drop(unsafe { Box::from_raw(finalize_hint.cast::<(Cb, *mut bool)>()) });
   }
 }

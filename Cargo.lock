@@ -1014,7 +1014,7 @@ dependencies = [
 [[package]]
 name = "napi-family-core"
 version = "0.1.0"
-source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=2522134c31209590643cc3522a7bb3aaa6829498#2522134c31209590643cc3522a7bb3aaa6829498"
+source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=838985f72c2c102c086e09d1907a6d62c3767048#838985f72c2c102c086e09d1907a6d62c3767048"
 
 [[package]]
 name = "napi-ohos"

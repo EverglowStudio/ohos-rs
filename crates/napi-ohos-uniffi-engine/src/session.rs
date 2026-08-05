@@ -252,7 +252,7 @@ impl LifecycleGate {
   }
 
   fn ensure_owner_thread(&self) -> Result<()> {
-    if std::thread::current().id() == self.owner_thread {
+    if self.is_owner_thread() {
       Ok(())
     } else {
       Err(Error::new(
@@ -260,6 +260,10 @@ impl LifecycleGate {
         "UniFFI callback invoker must run on the owning ArkVM thread",
       ))
     }
+  }
+
+  fn is_owner_thread(&self) -> bool {
+    std::thread::current().id() == self.owner_thread
   }
 }
 
@@ -334,6 +338,14 @@ impl SessionCallbackInvoker {
       ));
     }
     Ok(())
+  }
+
+  /// Return whether the current thread owns this session's ArkVM
+  /// environment. This checks only the immutable thread marker; it never
+  /// resolves SessionState or touches an N-API reference. Callers must still
+  /// use `check_open`/`with_host` before entering the Host.
+  pub fn is_owner_thread(&self) -> bool {
+    self.inner.gate.is_owner_thread()
   }
 
   /// Resolve the active session Host and Env for one owner-thread operation.
@@ -5319,11 +5331,14 @@ mod callback_invoker_tests {
   fn check_open_does_not_consume_invocation_id_and_rejects_off_thread() {
     let gate = LifecycleGate::new(ptr::null_mut());
     let invoker = SessionCallbackInvoker::new(gate.clone());
+    assert!(invoker.is_owner_thread());
     invoker.check_open().unwrap();
     assert_eq!(invoker.next_invocation_id().unwrap(), 0);
 
     let off_thread_invoker = invoker.clone();
-    let off_thread = std::thread::spawn(move || off_thread_invoker.check_open().is_err());
+    let off_thread = std::thread::spawn(move || {
+      (!off_thread_invoker.is_owner_thread()) && off_thread_invoker.check_open().is_err()
+    });
     assert!(off_thread.join().unwrap());
 
     gate.invalidate_invocations();

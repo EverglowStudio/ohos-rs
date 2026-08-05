@@ -9,7 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 napi-ohos = { path = "../napi", version = "=1.2.0", default-features = false, features = ["napi8", "tokio_rt"] }
-napi-family-core = { git = "https://github.com/EverglowStudio/napi-rs.git", rev = "838985f72c2c102c086e09d1907a6d62c3767048", version = "=0.1.0" }
+napi-family-core = { git = "https://github.com/EverglowStudio/napi-rs.git", rev = "81f2acce505b6d998a682dca9c86a47b395319c0", version = "=0.1.0" }
 napi-derive-backend-ohos = { path = "../backend", version = "=1.2.0" }
 proc-macro2 = "1"
 quote = "1"

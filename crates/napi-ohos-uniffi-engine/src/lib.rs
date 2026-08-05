@@ -35,7 +35,8 @@ pub use session::{
   SessionCallbackErrorStyle, SessionCallbackLease, SessionCallbackReentrancy,
   SessionCallbackRetention, SessionCallbackThreading, SessionCallbackTransfers, SessionNativeCall,
   SessionOperationDescriptor, SessionOperationDispatch, SessionReceiver, SessionResourceCallbacks,
-  SessionResourceReceiver, SessionStreamArgument, SessionStreamDirection, SessionValuePathSegment,
+  SessionResourceOwnership, SessionResourceReceiver, SessionResultResourceUseSite,
+  SessionStreamArgument, SessionStreamDirection, SessionValuePathSegment,
 };
 
 /// The single public native export installed by a generated OHOS module.
@@ -1308,18 +1309,42 @@ fn session_descriptor_tokens(
       )))
     }
   };
-  let result_receiver = match operation_result_receiver(family_operation) {
-    None => quote!(None),
-    Some(SessionResourceReceiver::Object) => quote!(Some(
-      napi_ohos_uniffi_engine::SessionResourceReceiver::Object
-    )),
-    Some(SessionResourceReceiver::OutputStream) => quote!(Some(
-      napi_ohos_uniffi_engine::SessionResourceReceiver::OutputStream
-    )),
-    Some(SessionResourceReceiver::InputStream) => quote!(Some(
-      napi_ohos_uniffi_engine::SessionResourceReceiver::InputStream
-    )),
-  };
+  let result_resources = family_operation
+    .result_resources
+    .iter()
+    .map(|resource| {
+      let path_tokens = session_path_tokens(&resource.path);
+      let kind = match resource.binding.kind {
+        napi_family_core::ResourceKind::Object => {
+          quote!(napi_ohos_uniffi_engine::SessionResourceReceiver::Object)
+        }
+        napi_family_core::ResourceKind::InputStream => {
+          quote!(napi_ohos_uniffi_engine::SessionResourceReceiver::InputStream)
+        }
+        napi_family_core::ResourceKind::OutputStream => {
+          quote!(napi_ohos_uniffi_engine::SessionResourceReceiver::OutputStream)
+        }
+      };
+      let ownership = match resource.binding.ownership {
+        napi_family_core::ResourceOwnership::Owned => {
+          quote!(napi_ohos_uniffi_engine::SessionResourceOwnership::Owned)
+        }
+        napi_family_core::ResourceOwnership::Borrowed => {
+          quote!(napi_ohos_uniffi_engine::SessionResourceOwnership::Borrowed)
+        }
+        napi_family_core::ResourceOwnership::ByArc => {
+          quote!(napi_ohos_uniffi_engine::SessionResourceOwnership::ByArc)
+        }
+      };
+      quote! {
+        napi_ohos_uniffi_engine::SessionResultResourceUseSite {
+          path: vec![#(#path_tokens),*],
+          kind: #kind,
+          ownership: #ownership,
+        }
+      }
+    })
+    .collect::<Vec<_>>();
   let has_argument_callbacks = family_operation.callbacks.iter().any(|use_site| {
     matches!(
       use_site.path.segments().first(),
@@ -1434,7 +1459,7 @@ fn session_descriptor_tokens(
       callback: #callback,
       native_call: #native_call,
       receiver: #receiver,
-      result: #result_receiver,
+      result_resources: vec![#(#result_resources),*],
       callback_transfer: #callback_transfer,
       callback_arguments: vec![#(#callback_arguments),*],
       stream_arguments: vec![#(#stream_arguments),*],
@@ -1455,21 +1480,6 @@ fn operation_receiver(
         napi_family_core::ResourceKind::OutputStream => SessionResourceReceiver::OutputStream,
       }))
     }
-  }
-}
-
-fn operation_result_receiver(
-  operation: &napi_family_core::FamilyOperation,
-) -> Option<SessionResourceReceiver> {
-  match operation.result.map(|resource| resource.kind) {
-    Some(napi_family_core::ResourceKind::Object) => Some(SessionResourceReceiver::Object),
-    Some(napi_family_core::ResourceKind::InputStream) => Some(SessionResourceReceiver::InputStream),
-    Some(napi_family_core::ResourceKind::OutputStream) => {
-      Some(SessionResourceReceiver::OutputStream)
-    }
-    _ => operation.streams.iter().find_map(|stream| {
-      (stream.direction == StreamDirection::Output).then_some(SessionResourceReceiver::OutputStream)
-    }),
   }
 }
 
@@ -2262,7 +2272,12 @@ impl<H: OhosHost> OhosBackendSession<H> {
       .state
       .lock()
       .map_err(|_| OhosError::new("OHOS session mutex poisoned"))?;
-    match (operation.result.map(|resource| resource.kind), value) {
+    let direct_result = operation
+      .result_resources
+      .iter()
+      .find(|resource| matches!(resource.path.segments(), [ValuePathSegment::Return]))
+      .map(|resource| resource.binding.kind);
+    match (direct_result, value) {
       (Some(napi_family_core::ResourceKind::Object), OhosValue::Object(id)) => {
         state.objects.insert(*id);
       }

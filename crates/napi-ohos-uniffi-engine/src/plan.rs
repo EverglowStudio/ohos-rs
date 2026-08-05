@@ -266,16 +266,18 @@ fn validate_resource_hooks(
       operation.receiver,
       Some(ReceiverBinding::Resource(resource)) if resource.kind == ResourceKind::Object
     ) || operation
-      .result
-      .is_some_and(|result| result.kind == ResourceKind::Object)
+      .result_resources
+      .iter()
+      .any(|result| result.binding.kind == ResourceKind::Object)
   });
   let needs_output = family.operations().iter().any(|operation| {
     matches!(
       operation.receiver,
       Some(ReceiverBinding::Resource(resource)) if resource.kind == ResourceKind::OutputStream
     ) || operation
-      .result
-      .is_some_and(|result| result.kind == ResourceKind::OutputStream)
+      .result_resources
+      .iter()
+      .any(|result| result.binding.kind == ResourceKind::OutputStream)
       || operation
         .streams
         .iter()
@@ -375,22 +377,32 @@ fn validate_result_resource(
   family: &FamilyOperation,
   operation: &OhosOperationPlan,
 ) -> Result<(), OhosEngineError> {
-  let valid = match family.result.map(|resource| resource.kind) {
-    None => !matches!(
-      operation.return_binding,
-      OhosReturnBinding::ObjectLease { .. } | OhosReturnBinding::OutputStreamLease { .. }
-    ),
+  let direct = family
+    .result_resources
+    .iter()
+    .filter(|resource| matches!(resource.path.segments(), [ValuePathSegment::Return]))
+    .map(|resource| resource.binding.kind)
+    .next();
+  let valid = match direct {
     Some(ResourceKind::Object) => matches!(
       operation.return_binding,
       OhosReturnBinding::ObjectLease { .. }
     ),
-    Some(ResourceKind::InputStream) => false,
-    Some(ResourceKind::OutputStream) => {
-      matches!(
-        operation.return_binding,
-        OhosReturnBinding::OutputStreamLease { .. }
-      )
-    }
+    Some(ResourceKind::OutputStream) => matches!(
+      operation.return_binding,
+      OhosReturnBinding::OutputStreamLease { .. }
+    ),
+    // Input streams are represented by a host-owned stream ID in the managed
+    // return carrier.  They are tracked mechanically by the session path
+    // walker rather than by a dedicated OHOS return binding.
+    Some(ResourceKind::InputStream) => !matches!(
+      operation.return_binding,
+      OhosReturnBinding::ObjectLease { .. } | OhosReturnBinding::OutputStreamLease { .. }
+    ),
+    None => !matches!(
+      operation.return_binding,
+      OhosReturnBinding::ObjectLease { .. } | OhosReturnBinding::OutputStreamLease { .. }
+    ),
   };
   if valid {
     Ok(())

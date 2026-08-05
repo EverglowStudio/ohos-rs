@@ -536,6 +536,64 @@ const object = { handle: 77 };
   ]);
   assert.equal(streams.filter(([kind, id]) => kind === 'release' && id === 444).length, 1);
   assert.equal(streams.filter(([kind, id]) => kind === 'release' && id === 445).length, 1);
+
+  // Nested result-resource paths fan out through Optional, Sequence and
+  // Variant selectors while preserving one owned lease for the same value.
+  const nestedCountSession = addon.__uniffi_backend_factory(host);
+  const nestedReleaseBefore = nestedCountSession.invokeSync(18, []).value;
+  const nestedObjectSession = addon.__uniffi_backend_factory(host);
+  const nestedObjectInput = { handle: 700 };
+  const nestedObjectResult = nestedObjectSession.invokeSync(28, [nestedObjectInput]).value;
+  assert.strictEqual(nestedObjectResult.optionalObject, nestedObjectInput);
+  assert.strictEqual(nestedObjectResult.objects[0], nestedObjectInput);
+  assert.strictEqual(nestedObjectResult.variant.object, nestedObjectInput);
+  await nestedObjectSession.close();
+
+  const nestedOutputSession = addon.__uniffi_backend_factory(host);
+  const nestedOutputInput = { handle: 701 };
+  const nestedOutputResult = nestedOutputSession.invokeSync(29, [nestedOutputInput]).value;
+  assert.strictEqual(nestedOutputResult.optionalOutput, nestedOutputInput);
+  assert.strictEqual(nestedOutputResult.outputs[0], nestedOutputInput);
+  assert.strictEqual(nestedOutputResult.variant.output, nestedOutputInput);
+  await nestedOutputSession.cancelOutputStream(nestedOutputResult.optionalOutput);
+  await nestedOutputSession.close();
+
+  const nestedInputSession = addon.__uniffi_backend_factory(host);
+  const nestedInputValue = { handle: 702 };
+  const nestedInputResult = nestedInputSession.invokeSync(30, [nestedInputValue]).value;
+  assert.strictEqual(nestedInputResult.optionalInput, nestedInputValue);
+  assert.strictEqual(nestedInputResult.inputs[0], nestedInputValue);
+  assert.strictEqual(nestedInputResult.variant.input, nestedInputValue);
+  const nestedInputReleaseBefore = streams.filter(([kind, id]) => kind === 'release' && id === 702).length;
+  await nestedInputSession.close();
+  assert.equal(streams.filter(([kind, id]) => kind === 'release' && id === 702).length, nestedInputReleaseBefore + 1);
+  assert.equal(nestedCountSession.invokeSync(18, []).value, nestedReleaseBefore + 111);
+
+  // An async nested result that outlives the 40ms deadline must be disposed
+  // independently after its Promise settles, without reviving the Host.
+  const lateNestedController = addon.__uniffi_backend_factory(host);
+  const lateNestedSession = addon.__uniffi_backend_factory(host);
+  const lateNestedInput = {
+    optionalObject: { handle: 710 },
+    objects: [{ handle: 711 }],
+    variant: { tag: 'Ready', input: { handle: 712 } },
+  };
+  const lateNestedBefore = nestedCountSession.invokeSync(18, []).value;
+  const lateNestedCallbacksBefore = callbackCalls.length;
+  const lateNestedResult = lateNestedSession.invokeAsync(31, [lateNestedInput]);
+  const lateNestedClose = lateNestedSession.close();
+  await new Promise((resolve) => originalSetTimeout(resolve, 80));
+  await lateNestedClose;
+  lateNestedController.invokeSync(32, []);
+  assert.deepEqual((await lateNestedResult).value, lateNestedInput);
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => originalSetTimeout(resolve, 80));
+  assert.equal(nestedCountSession.invokeSync(18, []).value, lateNestedBefore + 111);
+  assert.equal(streams.filter(([kind, id]) => kind === 'release' && id === 712).length, 1);
+  assert.equal(callbackCalls.length, lateNestedCallbacksBefore);
+  await lateNestedController.close();
+  await nestedCountSession.close();
+
   assert.throws(() => session.invokeSync(0, [1]), /closed/);
 })().catch((error) => {
   console.error(error);

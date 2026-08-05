@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Poll, Waker};
 
   use napi_ohos::bindgen_prelude::{
-    FnArgs, FromNapiValue, Function, JsObjectValue, JsValue, Object, Promise, ToNapiValue,
+    Env, FnArgs, FromNapiValue, Function, JsObjectValue, JsValue, Object, ObjectRef, Promise,
+    ToNapiValue, TypeName, ValidateNapiValue, ValueType,
   };
   use napi_ohos::sys;
   use napi_ohos::{threadsafe_function::ThreadsafeFunction, Status};
@@ -25,6 +26,8 @@ use std::task::{Poll, Waker};
   static NATIVE_NEVER_WAKER: OnceLock<Mutex<Option<Waker>>> = OnceLock::new();
   static OUTPUT_CANCEL_READY: AtomicBool = AtomicBool::new(false);
   static OUTPUT_CANCEL_WAKER: OnceLock<Mutex<Option<Waker>>> = OnceLock::new();
+  static NESTED_LATE_READY: AtomicBool = AtomicBool::new(false);
+  static NESTED_LATE_WAKER: OnceLock<Mutex<Option<Waker>>> = OnceLock::new();
 
   fn native_never_waker() -> &'static Mutex<Option<Waker>> {
     NATIVE_NEVER_WAKER.get_or_init(|| Mutex::new(None))
@@ -32,6 +35,10 @@ use std::task::{Poll, Waker};
 
   fn output_cancel_waker() -> &'static Mutex<Option<Waker>> {
     OUTPUT_CANCEL_WAKER.get_or_init(|| Mutex::new(None))
+  }
+
+  fn nested_late_waker() -> &'static Mutex<Option<Waker>> {
+    NESTED_LATE_WAKER.get_or_init(|| Mutex::new(None))
   }
 
   thread_local! {
@@ -141,6 +148,40 @@ use std::task::{Poll, Waker};
   #[derive(Clone, Copy)]
   pub struct ValueEnum {
     pub handle: u32,
+  }
+
+  pub struct SendObjectRef(ObjectRef<false>);
+
+  unsafe impl Send for SendObjectRef {}
+
+  impl TypeName for SendObjectRef {
+    fn type_name() -> &'static str {
+      "Object"
+    }
+
+    fn value_type() -> ValueType {
+      ValueType::Object
+    }
+  }
+
+  impl ValidateNapiValue for SendObjectRef {}
+
+  impl FromNapiValue for SendObjectRef {
+    unsafe fn from_napi_value(
+      env: napi_ohos::sys::napi_env,
+      value: napi_ohos::sys::napi_value,
+    ) -> napi_ohos::Result<Self> {
+      Ok(Self(ObjectRef::<false>::from_napi_value(env, value)?))
+    }
+  }
+
+  impl ToNapiValue for SendObjectRef {
+    unsafe fn to_napi_value(
+      env: napi_ohos::sys::napi_env,
+      value: Self,
+    ) -> napi_ohos::Result<napi_ohos::sys::napi_value> {
+      ObjectRef::<false>::to_napi_value(env, value.0)
+    }
   }
 
   pub fn lower_value_enum(value: Object<'static>) -> Result<ValueEnum, BridgeErrorDescriptor> {
@@ -382,6 +423,70 @@ use std::task::{Poll, Waker};
 
   pub fn release_count() -> u32 {
     RELEASE_COUNT.load(Ordering::Acquire)
+  }
+
+  fn nested_outer(env: &Env, optional: Object<'static>, sequence: Vec<Object<'static>>, variant: Object<'static>, optional_name: &str, sequence_name: &str) -> Object<'static> {
+    let mut outer = Object::new(env).expect("create nested result");
+    outer.set_named_property(optional_name, optional).expect("set nested optional");
+    outer.set_named_property(sequence_name, sequence).expect("set nested sequence");
+    outer.set_named_property("variant", variant).expect("set nested variant");
+    outer
+  }
+
+  pub fn nested_object(value: Object<'static>) -> Object<'static> {
+    let env = Env::from(value.value().env);
+    let mut variant = Object::new(&env).expect("create nested object variant");
+    variant.set_named_property("tag", "Ready").expect("set nested object tag");
+    variant.set_named_property("object", value).expect("set nested object variant value");
+    nested_outer(&env, value, vec![value], variant, "optionalObject", "objects")
+  }
+
+  pub fn nested_output(value: Object<'static>) -> Object<'static> {
+    let env = Env::from(value.value().env);
+    let mut variant = Object::new(&env).expect("create nested output variant");
+    variant.set_named_property("tag", "Ready").expect("set nested output tag");
+    variant.set_named_property("output", value).expect("set nested output variant value");
+    nested_outer(&env, value, vec![value], variant, "optionalOutput", "outputs")
+  }
+
+  pub fn nested_input(value: Object<'static>) -> Object<'static> {
+    let env = Env::from(value.value().env);
+    let mut variant = Object::new(&env).expect("create nested input variant");
+    variant.set_named_property("tag", "Ready").expect("set nested input tag");
+    variant.set_named_property("input", value).expect("set nested input variant value");
+    let mut outer = Object::new(&env).expect("create nested input result");
+    outer.set_named_property("optionalInput", value).expect("set nested input optional");
+    outer.set_named_property("inputs", vec![value]).expect("set nested input sequence");
+    outer.set_named_property("variant", variant).expect("set nested input variant");
+    outer
+  }
+
+  pub async fn nested_late_object(value: SendObjectRef) -> SendObjectRef {
+    poll_fn(|context| {
+      if NESTED_LATE_READY.load(Ordering::Acquire) {
+        Poll::Ready(())
+      } else {
+        nested_late_waker()
+          .lock()
+          .expect("nested late waker mutex poisoned")
+          .replace(context.waker().clone());
+        Poll::Pending
+      }
+    })
+    .await;
+    value
+  }
+
+  pub fn wake_nested_late() -> u32 {
+    NESTED_LATE_READY.store(true, Ordering::Release);
+    if let Some(waker) = nested_late_waker()
+      .lock()
+      .expect("nested late waker mutex poisoned")
+      .take()
+    {
+      waker.wake();
+    }
+    0
   }
 
   pub fn release_object(_handle: u32) -> Result<(), BridgeErrorDescriptor> {

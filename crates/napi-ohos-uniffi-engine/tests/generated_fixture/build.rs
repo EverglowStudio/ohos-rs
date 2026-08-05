@@ -21,7 +21,7 @@ fn direct_argument(value: &str, ty: syn::Type) -> OhosArgumentPlan {
 }
 
 fn family() -> FamilyPlan {
-  let mut operations = Vec::with_capacity(28);
+  let mut operations = Vec::with_capacity(33);
   push_operation(&mut operations, 0, OperationKind::Function, AsyncKind::Sync, false, 1, OperationDispatch::Native);
   push_operation(&mut operations, 1, OperationKind::Function, AsyncKind::Async, false, 1, OperationDispatch::Native);
   let i64_op = operation(2, OperationKind::Function, AsyncKind::Sync, false, 1, OperationDispatch::Native);
@@ -29,7 +29,11 @@ fn family() -> FamilyPlan {
   push_operation(&mut operations, 3, OperationKind::Function, AsyncKind::Sync, false, 1, OperationDispatch::Native);
   push_operation(&mut operations, 4, OperationKind::Function, AsyncKind::Sync, true, 1, OperationDispatch::Native);
   let mut object_op = operation(5, OperationKind::Function, AsyncKind::Sync, false, 1, OperationDispatch::Native);
-  object_op.result = Some(ResourceBinding { kind: ResourceKind::Object, ownership: ResourceOwnership::Owned });
+  object_op.result_resources.push(ResultResourceUseSite {
+    operation_id: 5,
+    path: ValuePath::return_value(),
+    binding: ResourceBinding { kind: ResourceKind::Object, ownership: ResourceOwnership::Owned },
+  });
   operations.push(object_op);
   let mut sync_callback = operation(6, OperationKind::Function, AsyncKind::Sync, true, 1, OperationDispatch::Native);
   sync_callback.callbacks.push(callback_site(6, CallbackThreading::CallingThread));
@@ -42,7 +46,11 @@ fn family() -> FamilyPlan {
   push_operation(&mut operations, 10, OperationKind::CallbackMethod, AsyncKind::Async, false, 1, OperationDispatch::CallbackHost { callback_type_id: 0, method_id: 2 });
   push_operation(&mut operations, 11, OperationKind::CallbackMethod, AsyncKind::Sync, false, 1, OperationDispatch::CallbackHost { callback_type_id: 0, method_id: 3 });
   let mut output_start = operation(12, OperationKind::OutputStreamStart, AsyncKind::Sync, false, 1, OperationDispatch::Native);
-  output_start.result = Some(ResourceBinding { kind: ResourceKind::OutputStream, ownership: ResourceOwnership::Owned });
+  output_start.result_resources.push(ResultResourceUseSite {
+    operation_id: 12,
+    path: ValuePath::return_value(),
+    binding: ResourceBinding { kind: ResourceKind::OutputStream, ownership: ResourceOwnership::Owned },
+  });
   output_start.callbacks.push(CallbackUseSite {
     operation_id: 12,
     callback_type_id: 0,
@@ -116,6 +124,19 @@ fn family() -> FamilyPlan {
   push_operation(&mut operations, 25, OperationKind::Function, AsyncKind::Async, false, 0, OperationDispatch::Native);
   push_operation(&mut operations, 26, OperationKind::Function, AsyncKind::Sync, false, 0, OperationDispatch::Native);
   push_operation(&mut operations, 27, OperationKind::Function, AsyncKind::Sync, false, 0, OperationDispatch::Native);
+  let mut nested_object = operation(28, OperationKind::Function, AsyncKind::Sync, false, 1, OperationDispatch::Native);
+  nested_object.result_resources = nested_resources(28, ResourceKind::Object, "optionalObject", "objects", "object");
+  operations.push(nested_object);
+  let mut nested_output = operation(29, OperationKind::Function, AsyncKind::Sync, false, 1, OperationDispatch::Native);
+  nested_output.result_resources = nested_resources(29, ResourceKind::OutputStream, "optionalOutput", "outputs", "output");
+  operations.push(nested_output);
+  let mut nested_input = operation(30, OperationKind::Function, AsyncKind::Sync, false, 1, OperationDispatch::Native);
+  nested_input.result_resources = nested_resources(30, ResourceKind::InputStream, "optionalInput", "inputs", "input");
+  operations.push(nested_input);
+  let mut late_nested_object = operation(31, OperationKind::Function, AsyncKind::Async, false, 1, OperationDispatch::Native);
+  late_nested_object.result_resources = mixed_late_resources(31);
+  operations.push(late_nested_object);
+  push_operation(&mut operations, 32, OperationKind::Function, AsyncKind::Sync, false, 0, OperationDispatch::Native);
   FamilyPlan::build(FamilyPlanInput {
     flavor: HostFlavor::Ohos,
     close_policy: ClosePolicy { grace_ms: 40, on_deadline: DeadlineAction::Detach },
@@ -143,7 +164,89 @@ fn operation(
   argument_count: usize,
   dispatch: OperationDispatch,
 ) -> FamilyOperationInput {
-  FamilyOperationInput { id, kind, async_kind, fallible, argument_count, dispatch, receiver: None, result: None, callbacks: Vec::new(), streams: Vec::new(), stream_slot: None }
+  FamilyOperationInput { id, kind, async_kind, fallible, argument_count, dispatch, receiver: None, result_resources: Vec::new(), callbacks: Vec::new(), streams: Vec::new(), stream_slot: None }
+}
+
+fn nested_resources(
+  operation_id: u32,
+  kind: ResourceKind,
+  optional_field: &str,
+  sequence_field: &str,
+  variant_field: &str,
+) -> Vec<ResultResourceUseSite> {
+  let binding = ResourceBinding { kind, ownership: ResourceOwnership::Owned };
+  vec![
+    ResultResourceUseSite {
+      operation_id,
+      path: ValuePath::new(vec![
+        ValuePathSegment::Return,
+        ValuePathSegment::Field(optional_field.to_owned()),
+        ValuePathSegment::Optional,
+      ]),
+      binding: binding.clone(),
+    },
+    ResultResourceUseSite {
+      operation_id,
+      path: ValuePath::new(vec![
+        ValuePathSegment::Return,
+        ValuePathSegment::Field(sequence_field.to_owned()),
+        ValuePathSegment::SequenceElement,
+      ]),
+      binding: binding.clone(),
+    },
+    ResultResourceUseSite {
+      operation_id,
+      path: ValuePath::new(vec![
+        ValuePathSegment::Return,
+        ValuePathSegment::Field("variant".to_owned()),
+        ValuePathSegment::Variant("Ready".to_owned()),
+        ValuePathSegment::Field(variant_field.to_owned()),
+      ]),
+      binding,
+    },
+  ]
+}
+
+fn mixed_late_resources(operation_id: u32) -> Vec<ResultResourceUseSite> {
+  vec![
+    ResultResourceUseSite {
+      operation_id,
+      path: ValuePath::new(vec![
+        ValuePathSegment::Return,
+        ValuePathSegment::Field("optionalObject".to_owned()),
+        ValuePathSegment::Optional,
+      ]),
+      binding: ResourceBinding {
+        kind: ResourceKind::Object,
+        ownership: ResourceOwnership::Owned,
+      },
+    },
+    ResultResourceUseSite {
+      operation_id,
+      path: ValuePath::new(vec![
+        ValuePathSegment::Return,
+        ValuePathSegment::Field("objects".to_owned()),
+        ValuePathSegment::SequenceElement,
+      ]),
+      binding: ResourceBinding {
+        kind: ResourceKind::OutputStream,
+        ownership: ResourceOwnership::Owned,
+      },
+    },
+    ResultResourceUseSite {
+      operation_id,
+      path: ValuePath::new(vec![
+        ValuePathSegment::Return,
+        ValuePathSegment::Field("variant".to_owned()),
+        ValuePathSegment::Variant("Ready".to_owned()),
+        ValuePathSegment::Field("input".to_owned()),
+      ]),
+      binding: ResourceBinding {
+        kind: ResourceKind::InputStream,
+        ownership: ResourceOwnership::Owned,
+      },
+    },
+  ]
 }
 
 fn stream_value_binding() -> StreamValueBinding {
@@ -203,6 +306,11 @@ fn operation_plans(family: &FamilyPlan) -> OhosBridgePlan {
       native(25, syn::parse_quote!(crate::generated_fixture::never_settle_native), Vec::new(), OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(u32) }, OhosErrorBinding::Infallible),
       native(26, syn::parse_quote!(crate::generated_fixture::wake_output_cancel), Vec::new(), OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(u32) }, OhosErrorBinding::Infallible),
       native(27, syn::parse_quote!(crate::generated_fixture::wake_never_settle_native), Vec::new(), OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(u32) }, OhosErrorBinding::Infallible),
+      native(28, syn::parse_quote!(crate::generated_fixture::nested_object), vec![direct_argument("value", syn::parse_quote!(napi_ohos::bindgen_prelude::Object<'static>))], OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(napi_ohos::bindgen_prelude::Object<'static>) }, OhosErrorBinding::Infallible),
+      native(29, syn::parse_quote!(crate::generated_fixture::nested_output), vec![direct_argument("value", syn::parse_quote!(napi_ohos::bindgen_prelude::Object<'static>))], OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(napi_ohos::bindgen_prelude::Object<'static>) }, OhosErrorBinding::Infallible),
+      native(30, syn::parse_quote!(crate::generated_fixture::nested_input), vec![direct_argument("value", syn::parse_quote!(napi_ohos::bindgen_prelude::Object<'static>))], OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(napi_ohos::bindgen_prelude::Object<'static>) }, OhosErrorBinding::Infallible),
+      native(31, syn::parse_quote!(crate::generated_fixture::nested_late_object), vec![direct_argument("value", syn::parse_quote!(crate::generated_fixture::SendObjectRef))], OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(crate::generated_fixture::SendObjectRef) }, OhosErrorBinding::Infallible),
+      native(32, syn::parse_quote!(crate::generated_fixture::wake_nested_late), Vec::new(), OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(u32) }, OhosErrorBinding::Infallible),
     ],
     OhosResourceHooks {
       release_object: Some(OhosResourceHook { call: syn::parse_quote!(crate::generated_fixture::release_object), carrier_type: syn::parse_quote!(u32) }),

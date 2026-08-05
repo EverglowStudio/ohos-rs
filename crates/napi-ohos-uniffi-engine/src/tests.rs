@@ -4,8 +4,8 @@ use napi_family_core::{
   AsyncKind, CallbackContract, CallbackReentrancy, CallbackRetention, CallbackThreading,
   CallbackUseSite, CarrierKind, ClosePolicy, ConversionRecipe, DeadlineAction,
   FamilyOperationInput, FamilyPlanInput, HostFlavor, OperationDispatch, OperationKind,
-  ReceiverBinding, ResourceBinding, ResourceKind, ResourceOwnership, StreamDirection,
-  StreamSlotIdentity, StreamUseSite, StreamValueBinding, ValuePath,
+  ReceiverBinding, ResourceBinding, ResourceKind, ResourceOwnership, ResultResourceUseSite,
+  StreamDirection, StreamSlotIdentity, StreamUseSite, StreamValueBinding, ValuePath,
 };
 use proc_macro2::{Ident, Span};
 use std::sync::{Arc, Mutex};
@@ -23,15 +23,10 @@ fn argument(name: &str, binding: OhosArgumentBinding) -> OhosArgumentPlan {
 
 fn native(
   id: u32,
-  argument_count: usize,
-  async_kind: AsyncKind,
-  fallible: bool,
-  result: Option<ResourceBinding>,
   arguments: Vec<OhosArgumentPlan>,
   return_binding: OhosReturnBinding,
   error_binding: OhosErrorBinding,
 ) -> OhosOperationPlan {
-  let _ = (argument_count, async_kind, fallible, result);
   OhosOperationPlan {
     operation_id: id,
     target: OhosOperationTarget::Native {
@@ -83,7 +78,7 @@ fn operation(
     argument_count,
     dispatch,
     receiver: None,
-    result: None,
+    result_resources: Vec::new(),
     callbacks: Vec::new(),
     streams: Vec::new(),
     stream_slot: None,
@@ -106,10 +101,6 @@ fn echo_plan(family: &FamilyPlan) -> OhosBridgePlan {
     family,
     vec![native(
       0,
-      1,
-      AsyncKind::Sync,
-      false,
-      None,
       vec![argument(
         "value",
         OhosArgumentBinding::Direct {
@@ -134,9 +125,13 @@ fn object_family() -> FamilyPlan {
     0,
     OperationDispatch::Native,
   );
-  op.result = Some(ResourceBinding {
-    kind: ResourceKind::Object,
-    ownership: ResourceOwnership::Owned,
+  op.result_resources.push(ResultResourceUseSite {
+    operation_id: 0,
+    path: ValuePath::return_value(),
+    binding: ResourceBinding {
+      kind: ResourceKind::Object,
+      ownership: ResourceOwnership::Owned,
+    },
   });
   family(vec![op])
 }
@@ -146,13 +141,6 @@ fn object_plan(family: &FamilyPlan) -> OhosBridgePlan {
     family,
     vec![native(
       0,
-      0,
-      AsyncKind::Sync,
-      false,
-      Some(ResourceBinding {
-        kind: ResourceKind::Object,
-        ownership: ResourceOwnership::Owned,
-      }),
       Vec::new(),
       OhosReturnBinding::ObjectLease {
         carrier_type: syn::parse_quote!(fixture::ObjectHandle),
@@ -180,9 +168,13 @@ fn output_family() -> FamilyPlan {
     0,
     OperationDispatch::Native,
   );
-  op.result = Some(ResourceBinding {
-    kind: ResourceKind::OutputStream,
-    ownership: ResourceOwnership::Owned,
+  op.result_resources.push(ResultResourceUseSite {
+    operation_id: 0,
+    path: ValuePath::return_value(),
+    binding: ResourceBinding {
+      kind: ResourceKind::OutputStream,
+      ownership: ResourceOwnership::Owned,
+    },
   });
   family(vec![op])
 }
@@ -192,13 +184,6 @@ fn output_plan(family: &FamilyPlan) -> OhosBridgePlan {
     family,
     vec![native(
       0,
-      0,
-      AsyncKind::Sync,
-      false,
-      Some(ResourceBinding {
-        kind: ResourceKind::OutputStream,
-        ownership: ResourceOwnership::Owned,
-      }),
       Vec::new(),
       OhosReturnBinding::OutputStreamLease {
         carrier_type: syn::parse_quote!(fixture::OutputStreamHandle),
@@ -335,10 +320,6 @@ fn callback_plan(family: &FamilyPlan) -> OhosBridgePlan {
     vec![
       native(
         0,
-        1,
-        AsyncKind::Sync,
-        false,
-        None,
         vec![argument(
           "callback",
           OhosArgumentBinding::CallbackProxy {
@@ -354,10 +335,6 @@ fn callback_plan(family: &FamilyPlan) -> OhosBridgePlan {
       host(3, OhosOperationTarget::InputStreamHostCancel),
       native(
         4,
-        1,
-        AsyncKind::Sync,
-        false,
-        None,
         vec![argument(
           "stream",
           OhosArgumentBinding::InputStreamProxy {

@@ -17,7 +17,7 @@ use std::task::{Poll, Waker};
   use napi_ohos::sys;
   use napi_ohos::{threadsafe_function::ThreadsafeFunction, Status};
   use napi_ohos_uniffi_engine::{
-    BridgeErrorDescriptor, ErrorData, ErrorDomain, SessionCallbackArgument,
+    BridgeErrorDescriptor, ErrorData, ErrorDomain, SessionCallbackArgument, SessionCallbackInvoker,
     SessionCallbackLease, SessionCallbackRetention, SessionCallbackThreading,
   };
 
@@ -250,6 +250,7 @@ use std::task::{Poll, Waker};
     callback_type_id: u32,
     callback_id: u32,
     contract: SessionCallbackArgument,
+    _invoker: SessionCallbackInvoker,
     lease: SessionCallbackLease,
   ) -> napi_ohos::Result<SyncObserverProxy> {
     if contract.retention != SessionCallbackRetention::Retained
@@ -292,6 +293,7 @@ use std::task::{Poll, Waker};
     callback_type_id: u32,
     callback_id: u32,
     callback: Arc<AsyncCallbackTsfn>,
+    invoker: SessionCallbackInvoker,
     lease: SessionCallbackLease,
   }
 
@@ -300,6 +302,7 @@ use std::task::{Poll, Waker};
     callback_type_id: u32,
     callback_id: u32,
     contract: SessionCallbackArgument,
+    invoker: SessionCallbackInvoker,
     lease: SessionCallbackLease,
   ) -> napi_ohos::Result<AsyncObserverProxy> {
     if contract.retention != SessionCallbackRetention::Retained
@@ -327,6 +330,7 @@ use std::task::{Poll, Waker};
       callback_type_id,
       callback_id,
       callback: Arc::new(callback),
+      invoker,
       lease,
     })
   }
@@ -346,17 +350,16 @@ use std::task::{Poll, Waker};
   impl AsyncObserverProxy {
     async fn call(&self, value: u32, method_id: u32) -> Result<u32, napi_ohos::Error> {
       let invocation = self
-      .callback
-      .call_async(AsyncCallbackArgs::from((
-        self.callback_type_id,
-        self.callback_id,
-        method_id,
-        self
-          .lease
-          .next_invocation_id()
-          .map_err(|error| napi_ohos::Error::new(Status::GenericFailure, error.to_string()))?,
-        vec![value],
-      )))
+        .callback
+        .call_async(AsyncCallbackArgs::from((
+          self.callback_type_id,
+          self.callback_id,
+          method_id,
+          self.invoker
+            .next_invocation_id()
+            .map_err(|error| napi_ohos::Error::new(Status::GenericFailure, error.to_string()))?,
+          vec![value],
+        )))
         .await
         .map_err(|error| napi_ohos::Error::new(Status::GenericFailure, error.to_string()))?;
       invocation
@@ -372,6 +375,7 @@ use std::task::{Poll, Waker};
     _callback_type_id: u32,
     _callback_id: u32,
     contract: SessionCallbackArgument,
+    _invoker: SessionCallbackInvoker,
   ) -> napi_ohos::Result<StreamFactoryProxy> {
     if contract.threading != SessionCallbackThreading::CallingThread
     {

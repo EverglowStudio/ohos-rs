@@ -380,7 +380,58 @@ fn structured_family_preserves_callback_method_ids_and_stream_contracts() {
     StreamDirection::Input
   );
   let generated = generate_ohos_source(&family, callback_plan(&family)).unwrap();
-  assert!(generated.source().to_string().contains("method_id : 3"));
+  let source = generated.source().to_string();
+  assert!(source.contains("method_id : 3"));
+  assert!(source.contains("callback_transfers . invoker ()"));
+  assert!(source.contains("__uniffi_callback_lease"));
+}
+
+#[test]
+fn scoped_callback_builder_receives_invoker_without_lease() {
+  let family = family(vec![{
+    let mut operation = operation(
+      0,
+      OperationKind::Function,
+      AsyncKind::Sync,
+      false,
+      1,
+      OperationDispatch::Native,
+    );
+    operation.callbacks.push(CallbackUseSite {
+      operation_id: 0,
+      callback_type_id: 9,
+      path: ValuePath::argument(0),
+      contract: CallbackContract {
+        retention: CallbackRetention::Scoped,
+        threading: CallbackThreading::CallingThread,
+        reentrancy: CallbackReentrancy::Allowed,
+      },
+    });
+    operation
+  }]);
+  let plan = OhosBridgePlan::build(
+    &family,
+    vec![native(
+      0,
+      vec![argument(
+        "callback",
+        OhosArgumentBinding::CallbackProxy {
+          rust_type: syn::parse_quote!(fixture::Callback),
+          build: syn::parse_quote!(fixture::build_callback),
+        },
+      )],
+      OhosReturnBinding::Unit,
+      OhosErrorBinding::Infallible,
+    )],
+  )
+  .unwrap();
+  let source = generate_ohos_source(&family, plan)
+    .unwrap()
+    .source()
+    .to_string();
+  assert!(source.contains("callback_transfers . invoker ()"));
+  assert!(source.contains("__uniffi_callback_invoker . clone ()"));
+  assert!(!source.contains("__uniffi_callback_lease"));
 }
 
 #[test]

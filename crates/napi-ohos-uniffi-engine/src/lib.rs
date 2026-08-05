@@ -32,11 +32,12 @@ pub use plan::*;
 mod session;
 pub use session::{
   create_backend_session, take_session_callback_transfers, SessionCallbackArgument,
-  SessionCallbackErrorStyle, SessionCallbackLease, SessionCallbackReentrancy,
-  SessionCallbackRetention, SessionCallbackThreading, SessionCallbackTransfers, SessionNativeCall,
-  SessionOperationDescriptor, SessionOperationDispatch, SessionReceiver, SessionResourceCallbacks,
-  SessionResourceOwnership, SessionResourceReceiver, SessionResultResourceUseSite,
-  SessionStreamArgument, SessionStreamDirection, SessionValuePathSegment,
+  SessionCallbackErrorStyle, SessionCallbackInvoker, SessionCallbackLease,
+  SessionCallbackReentrancy, SessionCallbackRetention, SessionCallbackThreading,
+  SessionCallbackTransfers, SessionNativeCall, SessionOperationDescriptor,
+  SessionOperationDispatch, SessionReceiver, SessionResourceCallbacks, SessionResourceOwnership,
+  SessionResourceReceiver, SessionResultResourceUseSite, SessionStreamArgument,
+  SessionStreamDirection, SessionValuePathSegment,
 };
 
 /// The single public native export installed by a generated OHOS module.
@@ -574,13 +575,10 @@ fn generate_operation(
       Some(ValuePathSegment::Argument(_))
     )
   });
-  let callback_transfer = has_argument_callbacks
-    && family.callbacks.iter().any(|use_site| {
-      matches!(
-        use_site.path.segments().first(),
-        Some(ValuePathSegment::Argument(_))
-      ) && use_site.contract.retention == CallbackRetention::Retained
-    });
+  // Keep one private transfer carrier for every argument-rooted callback,
+  // including scoped callbacks. It transports the engine-owned invoker while
+  // retained use-sites additionally populate lease slots.
+  let callback_transfer = has_argument_callbacks;
   let requires_host = has_argument_callbacks
     || family
       .streams
@@ -744,6 +742,12 @@ fn generate_operation(
           #generation_arg,
           #transfer_arg,
         )?;
+      let __uniffi_callback_invoker = __uniffi_callback_transfers
+        .invoker()
+        .map_err(|error| napi_ohos::Error::new(
+          napi_ohos::Status::GenericFailure,
+          error.to_string(),
+        ))?;
     });
   } else if operation
     .arguments
@@ -855,6 +859,7 @@ fn generate_operation(
               #callback_type_id,
               #wrapper_name,
               #contract,
+              __uniffi_callback_invoker.clone(),
               __uniffi_callback_lease,
             )?;
           });
@@ -865,6 +870,7 @@ fn generate_operation(
               #callback_type_id,
               #wrapper_name,
               #contract,
+              __uniffi_callback_invoker.clone(),
             )?;
           });
         }
@@ -1351,13 +1357,9 @@ fn session_descriptor_tokens(
       Some(ValuePathSegment::Argument(_))
     )
   });
-  let callback_transfer = has_argument_callbacks
-    && family_operation.callbacks.iter().any(|use_site| {
-      matches!(
-        use_site.path.segments().first(),
-        Some(ValuePathSegment::Argument(_))
-      ) && use_site.contract.retention == CallbackRetention::Retained
-    });
+  // The private transfer carrier also transports the session invoker for
+  // scoped callbacks; retained use-sites additionally populate lease slots.
+  let callback_transfer = has_argument_callbacks;
   let native_call = if has_argument_callbacks
     || family_operation
       .streams

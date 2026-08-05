@@ -21,7 +21,7 @@ fn direct_argument(value: &str, ty: syn::Type) -> OhosArgumentPlan {
 }
 
 fn family() -> FamilyPlan {
-  let mut operations = Vec::with_capacity(19);
+  let mut operations = Vec::with_capacity(21);
   push_operation(&mut operations, 0, OperationKind::Function, AsyncKind::Sync, false, 1, OperationDispatch::Native);
   push_operation(&mut operations, 1, OperationKind::Function, AsyncKind::Async, false, 1, OperationDispatch::Native);
   let i64_op = operation(2, OperationKind::Function, AsyncKind::Sync, false, 1, OperationDispatch::Native);
@@ -49,20 +49,58 @@ fn family() -> FamilyPlan {
     path: ValuePath::argument(0),
     contract: CallbackContract { retention: CallbackRetention::Scoped, threading: CallbackThreading::CallingThread, reentrancy: CallbackReentrancy::Forbidden },
   });
-  output_start.streams.push(StreamUseSite { operation_id: 12, path: ValuePath::return_value(), direction: StreamDirection::Output });
+  output_start.stream_slot = Some(StreamSlotIdentity { use_site_id: 1, operation_id: 12, kind: OperationKind::OutputStreamStart });
+  output_start.streams.push(StreamUseSite {
+    operation_id: 12,
+    use_site_id: 1,
+    path: ValuePath::return_value(),
+    direction: StreamDirection::Output,
+    item: stream_value_binding(),
+    error: stream_value_binding(),
+    is_send: true,
+    slots: vec![
+      StreamSlotIdentity { use_site_id: 1, operation_id: 12, kind: OperationKind::OutputStreamStart },
+      StreamSlotIdentity { use_site_id: 1, operation_id: 13, kind: OperationKind::OutputStreamNext },
+      StreamSlotIdentity { use_site_id: 1, operation_id: 14, kind: OperationKind::OutputStreamCancel },
+    ],
+  });
   operations.push(output_start);
   let mut output_next = operation(13, OperationKind::OutputStreamNext, AsyncKind::Async, false, 0, OperationDispatch::Native);
   output_next.receiver = Some(ResourceBinding { kind: ResourceKind::OutputStream, ownership: ResourceOwnership::Borrowed });
+  output_next.stream_slot = Some(StreamSlotIdentity { use_site_id: 1, operation_id: 13, kind: OperationKind::OutputStreamNext });
   operations.push(output_next);
   let mut output_cancel = operation(14, OperationKind::OutputStreamCancel, AsyncKind::Async, false, 0, OperationDispatch::Native);
   output_cancel.receiver = Some(ResourceBinding { kind: ResourceKind::OutputStream, ownership: ResourceOwnership::Borrowed });
+  output_cancel.stream_slot = Some(StreamSlotIdentity { use_site_id: 1, operation_id: 14, kind: OperationKind::OutputStreamCancel });
   operations.push(output_cancel);
   let mut input = operation(15, OperationKind::Function, AsyncKind::Async, false, 1, OperationDispatch::Native);
-  input.streams.push(StreamUseSite { operation_id: 15, path: ValuePath::argument(0), direction: StreamDirection::Input });
+  input.streams.push(StreamUseSite {
+    operation_id: 15,
+    use_site_id: 0,
+    path: ValuePath::argument(0),
+    direction: StreamDirection::Input,
+    item: stream_value_binding(),
+    error: stream_value_binding(),
+    is_send: false,
+    slots: vec![
+      StreamSlotIdentity { use_site_id: 0, operation_id: 16, kind: OperationKind::InputStreamPull },
+      StreamSlotIdentity { use_site_id: 0, operation_id: 17, kind: OperationKind::InputStreamCancel },
+    ],
+  });
   operations.push(input);
-  push_operation(&mut operations, 16, OperationKind::InputStreamPull, AsyncKind::Async, false, 1, OperationDispatch::InputStreamHostPull);
-  push_operation(&mut operations, 17, OperationKind::InputStreamCancel, AsyncKind::Async, false, 1, OperationDispatch::InputStreamHostCancel);
+  let mut input_pull = operation(16, OperationKind::InputStreamPull, AsyncKind::Async, false, 0, OperationDispatch::InputStreamHostPull);
+  input_pull.receiver = Some(ResourceBinding { kind: ResourceKind::InputStream, ownership: ResourceOwnership::Borrowed });
+  input_pull.stream_slot = Some(StreamSlotIdentity { use_site_id: 0, operation_id: 16, kind: OperationKind::InputStreamPull });
+  operations.push(input_pull);
+  let mut input_cancel = operation(17, OperationKind::InputStreamCancel, AsyncKind::Async, false, 0, OperationDispatch::InputStreamHostCancel);
+  input_cancel.receiver = Some(ResourceBinding { kind: ResourceKind::InputStream, ownership: ResourceOwnership::Borrowed });
+  input_cancel.stream_slot = Some(StreamSlotIdentity { use_site_id: 0, operation_id: 17, kind: OperationKind::InputStreamCancel });
+  operations.push(input_cancel);
   push_operation(&mut operations, 18, OperationKind::Function, AsyncKind::Sync, false, 0, OperationDispatch::Native);
+  let mut held_callback = operation(19, OperationKind::Function, AsyncKind::Sync, false, 1, OperationDispatch::Native);
+  held_callback.callbacks.push(callback_site(19, CallbackThreading::CallingThread));
+  operations.push(held_callback);
+  push_operation(&mut operations, 20, OperationKind::Function, AsyncKind::Sync, false, 0, OperationDispatch::Native);
   FamilyPlan::build(FamilyPlanInput { flavor: HostFlavor::Ohos, operations }).expect("valid generated fixture family plan")
 }
 
@@ -86,7 +124,11 @@ fn operation(
   argument_count: usize,
   dispatch: OperationDispatch,
 ) -> FamilyOperationInput {
-  FamilyOperationInput { id, kind, async_kind, fallible, argument_count, dispatch, receiver: None, result: None, callbacks: Vec::new(), streams: Vec::new() }
+  FamilyOperationInput { id, kind, async_kind, fallible, argument_count, dispatch, receiver: None, result: None, callbacks: Vec::new(), streams: Vec::new(), stream_slot: None }
+}
+
+fn stream_value_binding() -> StreamValueBinding {
+  StreamValueBinding { carrier: CarrierKind::Primitive, conversion: ConversionRecipe::Identity }
 }
 
 fn callback_site(operation_id: u32, threading: CallbackThreading) -> CallbackUseSite {
@@ -133,6 +175,8 @@ fn operation_plans(family: &FamilyPlan) -> OhosBridgePlan {
       native(15, syn::parse_quote!(crate::generated_fixture::consume_input), vec![OhosArgumentPlan { name: name("source"), binding: OhosArgumentBinding::InputStreamProxy { rust_type: syn::parse_quote!(crate::generated_fixture::InputProxy), build: syn::parse_quote!(crate::generated_fixture::build_input_proxy) } }], OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(u32) }, OhosErrorBinding::Infallible),
       host(16, OhosOperationTarget::InputStreamHostPull), host(17, OhosOperationTarget::InputStreamHostCancel),
       native(18, syn::parse_quote!(crate::generated_fixture::release_count), Vec::new(), OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(u32) }, OhosErrorBinding::Infallible),
+      native(19, syn::parse_quote!(crate::generated_fixture::hold_sync_observer), vec![OhosArgumentPlan { name: name("observer"), binding: OhosArgumentBinding::CallbackProxy { rust_type: syn::parse_quote!(crate::generated_fixture::SyncObserverProxy), build: syn::parse_quote!(crate::generated_fixture::build_sync_observer) } }], OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(u32) }, OhosErrorBinding::Infallible),
+      native(20, syn::parse_quote!(crate::generated_fixture::drop_held_sync_observers), Vec::new(), OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(u32) }, OhosErrorBinding::Infallible),
     ],
     OhosResourceHooks {
       release_object: Some(OhosResourceHook { call: syn::parse_quote!(crate::generated_fixture::release_object), carrier_type: syn::parse_quote!(u32) }),

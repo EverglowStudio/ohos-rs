@@ -23,6 +23,13 @@ pub enum OhosArgumentBinding {
     carrier_type: Type,
     lower: Path,
   },
+  /// A structured lowerer for nested callback/input-stream values. The
+  /// canonical value path remains in the family plan; this hook receives the
+  /// session Host and retained callback transfer table.
+  LowerWithHost {
+    carrier_type: Type,
+    lower: Path,
+  },
   ObjectLease {
     carrier_type: Type,
     lower: Path,
@@ -48,6 +55,7 @@ impl OhosArgumentBinding {
     match self {
       Self::Direct { carrier_type }
       | Self::LowerWith { carrier_type, .. }
+      | Self::LowerWithHost { carrier_type, .. }
       | Self::ObjectLease { carrier_type, .. }
       | Self::OutputStreamLease { carrier_type, .. } => carrier_type.clone(),
       Self::I64BigInt | Self::U64BigInt => syn::parse_quote!(napi_ohos::bindgen_prelude::BigInt),
@@ -213,6 +221,10 @@ impl OhosBridgePlan {
         return Err(OhosEngineError::HostOperationHasRustBindings {
           operation_id: operation.operation_id,
         });
+      } else if !family_operation.callbacks.is_empty() || !family_operation.streams.is_empty() {
+        return Err(OhosEngineError::HostOperationHasStructuredUseSites {
+          operation_id: operation.operation_id,
+        });
       }
       let mut names = BTreeSet::new();
       if let Some(receiver) = &operation.receiver {
@@ -324,6 +336,7 @@ fn validate_receiver(
         | (ResourceKind::OutputStream, OhosArgumentBinding::OutputStreamLease { ownership, .. }) => {
           *ownership == expected.ownership
         }
+        (ResourceKind::InputStream, OhosArgumentBinding::InputStreamProxy { .. }) => true,
         _ => false,
       };
       if valid {
@@ -356,6 +369,7 @@ fn validate_result_resource(
       operation.return_binding,
       OhosReturnBinding::ObjectLease { .. }
     ),
+    Some(ResourceKind::InputStream) => false,
     Some(ResourceKind::OutputStream) => {
       matches!(
         operation.return_binding,
@@ -377,32 +391,97 @@ fn validate_structured_bindings(
   operation: &OhosOperationPlan,
 ) -> Result<(), OhosEngineError> {
   for (index, argument) in operation.arguments.iter().enumerate() {
-    let callback_path = family.callbacks.iter().any(|use_site| {
-      matches!(use_site.path.segments(), [ValuePathSegment::Argument(argument_index)] if *argument_index as usize == index)
-    });
-    if callback_path && !matches!(argument.binding, OhosArgumentBinding::CallbackProxy { .. }) {
+    let callback_paths = family
+      .callbacks
+      .iter()
+      .filter(|use_site| {
+        matches!(
+          use_site.path.segments().first(),
+          Some(ValuePathSegment::Argument(argument_index)) if *argument_index as usize == index
+        )
+      })
+      .collect::<Vec<_>>();
+    let direct_callback = callback_paths
+      .iter()
+      .any(|use_site| matches!(use_site.path.segments(), [ValuePathSegment::Argument(_)]));
+    let nested_callback = callback_paths
+      .iter()
+      .any(|use_site| use_site.path.segments().len() > 1);
+    let callback_proxy = matches!(argument.binding, OhosArgumentBinding::CallbackProxy { .. });
+    let lower_with_host = matches!(argument.binding, OhosArgumentBinding::LowerWithHost { .. });
+    if direct_callback != callback_proxy {
       return Err(OhosEngineError::InvalidStructuredBinding {
         operation_id: operation.operation_id,
         argument: index,
         role: "callback",
       });
     }
-    let input_path = family.streams.iter().any(|use_site| {
-      use_site.direction == StreamDirection::Input
-        && matches!(use_site.path.segments(), [ValuePathSegment::Argument(argument_index)] if *argument_index as usize == index)
-    });
-    if input_path
-      && !matches!(
-        argument.binding,
-        OhosArgumentBinding::InputStreamProxy { .. }
-      )
-    {
+    let stream_paths = family
+      .streams
+      .iter()
+      .filter(|use_site| {
+        use_site.direction == StreamDirection::Input
+          && matches!(
+            use_site.path.segments().first(),
+            Some(ValuePathSegment::Argument(argument_index)) if *argument_index as usize == index
+          )
+      })
+      .collect::<Vec<_>>();
+    let direct_stream = stream_paths
+      .iter()
+      .any(|use_site| matches!(use_site.path.segments(), [ValuePathSegment::Argument(_)]));
+    let nested_stream = stream_paths
+      .iter()
+      .any(|use_site| use_site.path.segments().len() > 1);
+    let input_stream_proxy = matches!(
+      argument.binding,
+      OhosArgumentBinding::InputStreamProxy { .. }
+    );
+    if direct_stream != input_stream_proxy {
       return Err(OhosEngineError::InvalidStructuredBinding {
         operation_id: operation.operation_id,
         argument: index,
         role: "input stream",
       });
     }
+    let nested_structured = nested_callback || nested_stream;
+    if nested_structured != lower_with_host {
+      return Err(OhosEngineError::InvalidStructuredBinding {
+        operation_id: operation.operation_id,
+        argument: index,
+        role: if nested_callback {
+          "callback"
+        } else if nested_stream {
+          "input stream"
+        } else {
+          "callback or input stream"
+        },
+      });
+    }
+  }
+
+  let return_callbacks = family
+    .callbacks
+    .iter()
+    .filter(|use_site| {
+      matches!(
+        use_site.path.segments().first(),
+        Some(ValuePathSegment::Return)
+      )
+    })
+    .collect::<Vec<_>>();
+  let direct_return_callback = return_callbacks
+    .iter()
+    .any(|use_site| matches!(use_site.path.segments(), [ValuePathSegment::Return]));
+  let callback_lease = matches!(
+    operation.return_binding,
+    OhosReturnBinding::CallbackLease { .. }
+  );
+  if direct_return_callback != callback_lease {
+    return Err(OhosEngineError::InvalidReturnBinding {
+      operation_id: operation.operation_id,
+      expected: "a direct callback lease matching the canonical return use-site",
+    });
   }
   Ok(())
 }

@@ -2,7 +2,8 @@
 
 #[allow(dead_code)]
 mod generated_fixture {
-  use std::ffi::CString;
+use std::cell::RefCell;
+use std::ffi::CString;
   use std::ptr;
   use std::sync::atomic::{AtomicU32, Ordering};
   use std::sync::Arc;
@@ -14,11 +15,17 @@ mod generated_fixture {
   use napi_ohos::{threadsafe_function::ThreadsafeFunction, Status};
   use napi_ohos_uniffi_engine::{
     BridgeErrorDescriptor, ErrorData, ErrorDomain, SessionCallbackArgument,
-    SessionCallbackRetention,
-    SessionCallbackThreading,
+    SessionCallbackLease, SessionCallbackRetention, SessionCallbackThreading,
   };
 
   static RELEASE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+  thread_local! {
+    // Keep one native callback proxy alive across an operation boundary so
+    // the fixture proves retained leases follow proxy ownership rather than
+    // being unconditionally released by the session at return.
+    static HELD_SYNC_OBSERVERS: RefCell<Vec<SyncObserverProxy>> = const { RefCell::new(Vec::new()) };
+  }
 
   pub fn sync_echo(value: u32) -> u32 {
     value
@@ -74,6 +81,7 @@ mod generated_fixture {
     host: Object<'static>,
     callback_type_id: u32,
     callback_id: u32,
+    lease: SessionCallbackLease,
   }
 
   impl SyncObserverProxy {
@@ -114,6 +122,7 @@ mod generated_fixture {
     callback_type_id: u32,
     callback_id: u32,
     contract: SessionCallbackArgument,
+    lease: SessionCallbackLease,
   ) -> napi_ohos::Result<SyncObserverProxy> {
     if contract.retention != SessionCallbackRetention::Retained
       || contract.threading != SessionCallbackThreading::CallingThread
@@ -127,6 +136,7 @@ mod generated_fixture {
       host: *host,
       callback_type_id,
       callback_id,
+      lease,
     })
   }
 
@@ -134,6 +144,16 @@ mod generated_fixture {
     let fallible = observer.call(5, 1)?;
     let infallible = observer.call(6, 3)?;
     Ok(fallible + infallible)
+  }
+
+  pub fn hold_sync_observer(observer: SyncObserverProxy) -> u32 {
+    HELD_SYNC_OBSERVERS.with(|held| held.borrow_mut().push(observer));
+    0
+  }
+
+  pub fn drop_held_sync_observers() -> u32 {
+    HELD_SYNC_OBSERVERS.with(|held| held.borrow_mut().clear());
+    0
   }
 
   type AsyncCallbackArgs = FnArgs<(u32, u32, u32, u32, Vec<u32>)>;
@@ -144,6 +164,7 @@ mod generated_fixture {
     callback_type_id: u32,
     callback_id: u32,
     callback: Arc<AsyncCallbackTsfn>,
+    lease: SessionCallbackLease,
   }
 
   pub fn build_async_observer(
@@ -151,6 +172,7 @@ mod generated_fixture {
     callback_type_id: u32,
     callback_id: u32,
     contract: SessionCallbackArgument,
+    lease: SessionCallbackLease,
   ) -> napi_ohos::Result<AsyncObserverProxy> {
     if contract.retention != SessionCallbackRetention::Retained
       || contract.threading != SessionCallbackThreading::CallingThread
@@ -169,13 +191,15 @@ mod generated_fixture {
     let callback = host
       .get_named_property::<Function<'static, AsyncCallbackArgs, Promise<u32>>>(
         "invokeCallbackAsync",
-      )?
+      )
+      ?
       .build_threadsafe_function()
       .build()?;
     Ok(AsyncObserverProxy {
       callback_type_id,
       callback_id,
       callback: Arc::new(callback),
+      lease,
     })
   }
 
@@ -194,14 +218,17 @@ mod generated_fixture {
   impl AsyncObserverProxy {
     async fn call(&self, value: u32, method_id: u32) -> Result<u32, napi_ohos::Error> {
       let invocation = self
-        .callback
-        .call_async(AsyncCallbackArgs::from((
-          self.callback_type_id,
-          self.callback_id,
-          method_id,
-          0,
-          vec![value],
-        )))
+      .callback
+      .call_async(AsyncCallbackArgs::from((
+        self.callback_type_id,
+        self.callback_id,
+        method_id,
+        self
+          .lease
+          .next_invocation_id()
+          .map_err(|error| napi_ohos::Error::new(Status::GenericFailure, error.to_string()))?,
+        vec![value],
+      )))
         .await
         .map_err(|error| napi_ohos::Error::new(Status::GenericFailure, error.to_string()))?;
       invocation
@@ -225,8 +252,7 @@ mod generated_fixture {
         "unexpected stream factory contract",
       ));
     }
-    let raw_host = host.get_named_property::<Object<'static>>("__uniffiRawHost")?;
-    Ok(StreamFactoryProxy(raw_host))
+    Ok(StreamFactoryProxy(*host))
   }
 
   pub fn open_stream(proxy: StreamFactoryProxy) -> Object<'static> {

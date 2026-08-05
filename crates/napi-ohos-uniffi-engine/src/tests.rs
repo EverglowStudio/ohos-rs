@@ -2,9 +2,9 @@ use super::*;
 use futures::executor::block_on;
 use napi_family_core::{
   AsyncKind, CallbackContract, CallbackReentrancy, CallbackRetention, CallbackThreading,
-  CallbackUseSite, FamilyOperationInput, FamilyPlanInput, HostFlavor, OperationDispatch,
-  OperationKind, ResourceBinding, ResourceKind, ResourceOwnership, StreamDirection, StreamUseSite,
-  ValuePath,
+  CallbackUseSite, CarrierKind, ConversionRecipe, FamilyOperationInput, FamilyPlanInput,
+  HostFlavor, OperationDispatch, OperationKind, ResourceBinding, ResourceKind, ResourceOwnership,
+  StreamDirection, StreamSlotIdentity, StreamUseSite, StreamValueBinding, ValuePath,
 };
 use proc_macro2::{Ident, Span};
 use std::sync::{Arc, Mutex};
@@ -81,6 +81,7 @@ fn operation(
     result: None,
     callbacks: Vec::new(),
     streams: Vec::new(),
+    stream_slot: None,
   }
 }
 
@@ -247,7 +248,7 @@ fn callback_family() -> FamilyPlan {
       method_id: 3,
     },
   );
-  let mut input = operation(
+  let input = operation(
     2,
     OperationKind::InputStreamPull,
     AsyncKind::Async,
@@ -255,12 +256,72 @@ fn callback_family() -> FamilyPlan {
     1,
     OperationDispatch::InputStreamHostPull,
   );
-  input.streams.push(StreamUseSite {
-    operation_id: 2,
-    path: ValuePath::argument(0),
-    direction: StreamDirection::Input,
+  let stream_source = {
+    let mut operation = operation(
+      4,
+      OperationKind::Function,
+      AsyncKind::Sync,
+      false,
+      1,
+      OperationDispatch::Native,
+    );
+    operation.streams.push(StreamUseSite {
+      operation_id: 4,
+      use_site_id: 0,
+      path: ValuePath::argument(0),
+      direction: StreamDirection::Input,
+      item: StreamValueBinding {
+        carrier: CarrierKind::Primitive,
+        conversion: ConversionRecipe::Identity,
+      },
+      error: StreamValueBinding {
+        carrier: CarrierKind::Primitive,
+        conversion: ConversionRecipe::Identity,
+      },
+      is_send: false,
+      slots: vec![
+        StreamSlotIdentity {
+          use_site_id: 0,
+          operation_id: 2,
+          kind: OperationKind::InputStreamPull,
+        },
+        StreamSlotIdentity {
+          use_site_id: 0,
+          operation_id: 3,
+          kind: OperationKind::InputStreamCancel,
+        },
+      ],
+    });
+    operation
+  };
+  let mut input = input;
+  input.receiver = Some(ResourceBinding {
+    kind: ResourceKind::InputStream,
+    ownership: ResourceOwnership::Borrowed,
   });
-  family(vec![op, method, input])
+  input.stream_slot = Some(StreamSlotIdentity {
+    use_site_id: 0,
+    operation_id: 2,
+    kind: OperationKind::InputStreamPull,
+  });
+  let mut cancel = operation(
+    3,
+    OperationKind::InputStreamCancel,
+    AsyncKind::Async,
+    false,
+    0,
+    OperationDispatch::InputStreamHostCancel,
+  );
+  cancel.receiver = Some(ResourceBinding {
+    kind: ResourceKind::InputStream,
+    ownership: ResourceOwnership::Borrowed,
+  });
+  cancel.stream_slot = Some(StreamSlotIdentity {
+    use_site_id: 0,
+    operation_id: 3,
+    kind: OperationKind::InputStreamCancel,
+  });
+  family(vec![op, method, input, cancel, stream_source])
 }
 
 fn callback_plan(family: &FamilyPlan) -> OhosBridgePlan {
@@ -285,6 +346,23 @@ fn callback_plan(family: &FamilyPlan) -> OhosBridgePlan {
       ),
       host(1, OhosOperationTarget::CallbackHost),
       host(2, OhosOperationTarget::InputStreamHostPull),
+      host(3, OhosOperationTarget::InputStreamHostCancel),
+      native(
+        4,
+        1,
+        AsyncKind::Sync,
+        false,
+        None,
+        vec![argument(
+          "stream",
+          OhosArgumentBinding::InputStreamProxy {
+            rust_type: syn::parse_quote!(fixture::InputStream),
+            build: syn::parse_quote!(fixture::build_input_stream),
+          },
+        )],
+        OhosReturnBinding::Unit,
+        OhosErrorBinding::Infallible,
+      ),
     ],
   )
   .unwrap()
@@ -316,7 +394,7 @@ fn structured_family_preserves_callback_method_ids_and_stream_contracts() {
     }
   );
   assert_eq!(
-    family.operations()[2].streams[0].direction,
+    family.operations()[4].streams[0].direction,
     StreamDirection::Input
   );
   let generated = generate_ohos_source(&family, callback_plan(&family)).unwrap();

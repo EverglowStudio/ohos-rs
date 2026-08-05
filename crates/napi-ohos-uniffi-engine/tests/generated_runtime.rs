@@ -193,6 +193,24 @@ const object = { handle: 77 };
   }
   assert.equal(session.invokeSync(18, []).value, 111);
 
+  // A native consumer can keep a retained callback proxy after the call
+  // returns.  Its lease must remain live until the consumer explicitly drops
+  // that proxy, then release exactly once on the JS-thread scheduler.
+  assert.equal(session.invokeSync(19, [30]).value, 0);
+  assert.deepEqual(lifecycle.slice(-1), [['retain', 0, 30]]);
+  assert.equal(session.invokeSync(20, []).value, 0);
+  for (
+    let turn = 0;
+    turn < 20 && !(lifecycle.at(-1)?.[0] === 'release' && lifecycle.at(-1)?.[2] === 30);
+    turn++
+  ) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.deepEqual(lifecycle.slice(-2), [
+    ['retain', 0, 30],
+    ['release', 0, 30],
+  ]);
+
   const closeObject = { handle: 99 };
   assert.equal(session.invokeSync(5, [closeObject]).value, closeObject);
   const closeOutput = session.invokeSync(12, [12]).value;
@@ -240,9 +258,11 @@ const object = { handle: 77 };
   ]);
   assert.deepEqual(lifecycle, [
     ['retain', 0, 10],
-    ['retain', 0, 20],
     ['release', 0, 10],
+    ['retain', 0, 20],
     ['release', 0, 20],
+    ['retain', 0, 30],
+    ['release', 0, 30],
   ]);
   assert.deepEqual(streams, [
     ['pull', 9],

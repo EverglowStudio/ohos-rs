@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex};
 use napi_derive_backend_ohos::{NapiFn, NapiFnArg, NapiFnArgKind, NapiFnBuilder, TryToTokens};
 use napi_family_core::{
   AsyncKind, BigIntWords, CallbackReentrancy, CallbackRetention, CallbackThreading,
-  FamilyOperation, FamilyOperationTarget, FamilyPlan, FamilyPlanError, OperationKind,
-  StreamDirection, ValuePathSegment,
+  CallbackUseSite, FamilyOperation, FamilyOperationTarget, FamilyPlan, FamilyPlanError,
+  OperationKind, StreamDirection, ValuePath, ValuePathSegment,
 };
 use napi_ohos::bindgen_prelude::{BigInt, ToNapiValue};
 use napi_ohos::{sys, Result as NapiResult};
@@ -30,10 +30,11 @@ mod plan;
 pub use plan::*;
 mod session;
 pub use session::{
-  create_backend_session, SessionCallbackArgument, SessionCallbackErrorStyle,
-  SessionCallbackReentrancy, SessionCallbackRetention, SessionCallbackThreading, SessionNativeCall,
+  create_backend_session, take_session_callback_transfers, SessionCallbackArgument,
+  SessionCallbackErrorStyle, SessionCallbackLease, SessionCallbackReentrancy,
+  SessionCallbackRetention, SessionCallbackThreading, SessionCallbackTransfers, SessionNativeCall,
   SessionOperationDescriptor, SessionOperationDispatch, SessionResourceCallbacks,
-  SessionResourceReceiver, SessionStreamArgument, SessionStreamDirection,
+  SessionResourceReceiver, SessionStreamArgument, SessionStreamDirection, SessionValuePathSegment,
 };
 
 /// The single public native export installed by a generated OHOS module.
@@ -551,12 +552,35 @@ fn generate_operation(
   let callback_factory = format_ident!("_napi_rs_internal_register___uniffi_raw_operation_{id}");
   let register_name = format_ident!("__napi_register_uniffi_raw_operation_{id}");
   let return_carrier = operation.return_binding.carrier_type();
-  let requires_host = operation.arguments.iter().any(|argument| {
+  // Return-rooted callback use-sites are retained after async settlement;
+  // argument-rooted use-sites require the session Host and transfer table
+  // while entering the native call.
+  let has_argument_callbacks = family.callbacks.iter().any(|use_site| {
     matches!(
-      argument.binding,
-      OhosArgumentBinding::CallbackProxy { .. } | OhosArgumentBinding::InputStreamProxy { .. }
+      use_site.path.segments().first(),
+      Some(ValuePathSegment::Argument(_))
     )
   });
+  let callback_transfer = has_argument_callbacks
+    && family.callbacks.iter().any(|use_site| {
+      matches!(
+        use_site.path.segments().first(),
+        Some(ValuePathSegment::Argument(_))
+      ) && use_site.contract.retention == CallbackRetention::Retained
+    });
+  let requires_host = has_argument_callbacks
+    || family
+      .streams
+      .iter()
+      .any(|use_site| use_site.direction == StreamDirection::Input)
+    || operation.arguments.iter().any(|argument| {
+      matches!(
+        argument.binding,
+        OhosArgumentBinding::CallbackProxy { .. }
+          | OhosArgumentBinding::InputStreamProxy { .. }
+          | OhosArgumentBinding::LowerWithHost { .. }
+      )
+    });
 
   let mut builder = NapiFnBuilder::new(function_name.clone(), function_name.to_string());
   if requires_host {
@@ -566,6 +590,14 @@ fn generate_operation(
       ))),
       ts_arg_type: None,
     });
+  }
+  if callback_transfer {
+    for name in ["__uniffi_session_generation", "__uniffi_callback_transfer"] {
+      builder = builder.argument(NapiFnArg {
+        kind: NapiFnArgKind::PatType(Box::new(syn::parse_quote!(#name: u32))),
+        ts_arg_type: None,
+      });
+    }
   }
 
   let mut argument_names = Vec::with_capacity(operation.arguments.len() + 1);
@@ -595,9 +627,43 @@ fn generate_operation(
     });
   }
 
+  let mut lowerings = lowerings;
+  // Host and transfer carriers are wrapper-only values.  The OHOS async
+  // executor requires the future captured by the generated callback to be
+  // `Send`; keeping a raw N-API Host pointer in that future would violate
+  // that contract.  Build callback/stream proxies in `pre_call` while the
+  // wrapper is still on the JS thread, then pass the owned Rust proxy into the
+  // raw operation body.
+  let wrapper_arg_count = usize::from(requires_host) + usize::from(callback_transfer) * 2;
+  let first_operation_arg = wrapper_arg_count + usize::from(operation.receiver.is_some());
   let host_arg = Ident::new("arg0", Span::call_site());
-  let first_operation_arg = usize::from(requires_host) + usize::from(operation.receiver.is_some());
   let mut pre_call = TokenStream::new();
+  if callback_transfer {
+    let generation_arg = Ident::new(
+      &format!("arg{}", usize::from(requires_host)),
+      Span::call_site(),
+    );
+    let transfer_arg = Ident::new(
+      &format!("arg{}", usize::from(requires_host) + 1),
+      Span::call_site(),
+    );
+    pre_call.extend(quote! {
+      let __uniffi_callback_transfers =
+        napi_ohos_uniffi_engine::take_session_callback_transfers(
+          #generation_arg,
+          #transfer_arg,
+        )?;
+    });
+  } else if operation
+    .arguments
+    .iter()
+    .any(|argument| matches!(argument.binding, OhosArgumentBinding::LowerWithHost { .. }))
+  {
+    pre_call.extend(quote! {
+      let __uniffi_callback_transfers =
+        napi_ohos_uniffi_engine::SessionCallbackTransfers::empty();
+    });
+  }
   for (argument_index, argument) in operation.arguments.iter().enumerate() {
     let name = &argument.name;
     let carrier_type = argument.binding.carrier_type();
@@ -641,13 +707,29 @@ fn generate_operation(
           Err(error) => return napi_ohos_uniffi_engine::OhosCallResult::Error(error),
         };
       }),
+      OhosArgumentBinding::LowerWithHost { lower, .. } => {
+        let wrapper_name = Ident::new(
+          &format!("arg{}", first_operation_arg + argument_index),
+          Span::call_site(),
+        );
+        pre_call.extend(quote! {
+          let #wrapper_name = #lower(
+            &#host_arg,
+            #wrapper_name,
+            &__uniffi_callback_transfers,
+          ).map_err(|error| napi_ohos::Error::new(
+            napi_ohos::Status::GenericFailure,
+            error.to_string(),
+          ))?;
+        });
+      }
       OhosArgumentBinding::CallbackProxy { build, .. } => {
         let callback = family
           .callbacks
           .iter()
           .find(|use_site| {
             matches!(
-              use_site.path.segments(),
+              use_site.path.segments().as_ref(),
               [ValuePathSegment::Argument(index)] if *index as usize == argument_index
             )
           })
@@ -657,25 +739,48 @@ fn generate_operation(
             role: "callback",
           })?;
         let callback_type_id = callback.callback_type_id;
-        let contract = callback_contract_tokens(callback, argument_index as u32);
-        let wrapper_arg = Ident::new(
+        let contract = callback_contract_tokens(callback);
+        let callback_index = family
+          .callbacks
+          .iter()
+          .position(|candidate| std::ptr::eq(candidate, callback))
+          .expect("callback use-site belongs to family operation");
+        let wrapper_name = Ident::new(
           &format!("arg{}", first_operation_arg + argument_index),
           Span::call_site(),
         );
-        pre_call.extend(quote! {
-          let #wrapper_arg = #build(
-            &#host_arg,
-            #callback_type_id,
-            #wrapper_arg,
-            #contract,
-          )?;
-        });
+        if callback.contract.retention == CallbackRetention::Retained {
+          pre_call.extend(quote! {
+            let __uniffi_callback_lease = __uniffi_callback_transfers
+              .lease(#callback_index, 0)
+              .map_err(|error| napi_ohos::Error::new(
+                napi_ohos::Status::GenericFailure,
+                error.to_string(),
+              ))?;
+            let #wrapper_name = #build(
+              &#host_arg,
+              #callback_type_id,
+              #wrapper_name,
+              #contract,
+              __uniffi_callback_lease,
+            )?;
+          });
+        } else {
+          pre_call.extend(quote! {
+            let #wrapper_name = #build(
+              &#host_arg,
+              #callback_type_id,
+              #wrapper_name,
+              #contract,
+            )?;
+          });
+        }
       }
       OhosArgumentBinding::InputStreamProxy { build, .. } => {
         let found = family.streams.iter().any(|use_site| {
           use_site.direction == StreamDirection::Input
             && matches!(
-              use_site.path.segments(),
+              use_site.path.segments().as_ref(),
               [ValuePathSegment::Argument(index)] if *index as usize == argument_index
             )
         });
@@ -686,12 +791,12 @@ fn generate_operation(
             role: "input stream",
           });
         }
-        let wrapper_arg = Ident::new(
+        let wrapper_name = Ident::new(
           &format!("arg{}", first_operation_arg + argument_index),
           Span::call_site(),
         );
         pre_call.extend(quote! {
-          let #wrapper_arg = #build(&#host_arg, #wrapper_arg)?;
+          let #wrapper_name = #build(&#host_arg, #wrapper_name)?;
         });
       }
     }
@@ -758,7 +863,7 @@ fn generate_operation(
       napi_ohos_uniffi_engine::OhosCallResult<#return_carrier>
     ))
     .pre_call(pre_call)
-    .leading_wrapper_args(usize::from(requires_host))
+    .leading_wrapper_args(wrapper_arg_count)
     .asynchronous(family.async_kind == AsyncKind::Async)
     .strict(true)
     .skip_typescript(true)
@@ -772,10 +877,7 @@ fn generate_operation(
   })
 }
 
-fn callback_contract_tokens(
-  callback: &napi_family_core::CallbackUseSite,
-  argument_index: u32,
-) -> TokenStream {
+fn callback_contract_tokens(callback: &CallbackUseSite) -> TokenStream {
   let callback_type_id = callback.callback_type_id;
   let retention = match callback.contract.retention {
     CallbackRetention::Scoped => {
@@ -801,15 +903,48 @@ fn callback_contract_tokens(
       quote!(napi_ohos_uniffi_engine::SessionCallbackReentrancy::Forbidden)
     }
   };
+  let path_tokens = session_path_tokens(&callback.path);
   quote! {
     napi_ohos_uniffi_engine::SessionCallbackArgument {
-      argument_index: #argument_index,
+      path: vec![#(#path_tokens),*],
       callback_type_id: #callback_type_id,
       retention: #retention,
       threading: #threading,
       reentrancy: #reentrancy,
     }
   }
+}
+
+fn session_path_tokens(path: &ValuePath) -> Vec<TokenStream> {
+  path
+    .segments()
+    .iter()
+    .map(|segment| match segment {
+      ValuePathSegment::Argument(index) => {
+        quote!(napi_ohos_uniffi_engine::SessionValuePathSegment::Argument(#index))
+      }
+      ValuePathSegment::Return => quote!(napi_ohos_uniffi_engine::SessionValuePathSegment::Return),
+      ValuePathSegment::Field(name) => {
+        quote!(napi_ohos_uniffi_engine::SessionValuePathSegment::Field(#name.to_owned()))
+      }
+      ValuePathSegment::Variant(name) => {
+        quote!(napi_ohos_uniffi_engine::SessionValuePathSegment::Variant(#name.to_owned()))
+      }
+      ValuePathSegment::Optional => {
+        quote!(napi_ohos_uniffi_engine::SessionValuePathSegment::Optional)
+      }
+      ValuePathSegment::SequenceElement => {
+        quote!(napi_ohos_uniffi_engine::SessionValuePathSegment::SequenceElement)
+      }
+      ValuePathSegment::MapKey => quote!(napi_ohos_uniffi_engine::SessionValuePathSegment::MapKey),
+      ValuePathSegment::MapValue => {
+        quote!(napi_ohos_uniffi_engine::SessionValuePathSegment::MapValue)
+      }
+      ValuePathSegment::SetElement => {
+        quote!(napi_ohos_uniffi_engine::SessionValuePathSegment::SetElement)
+      }
+    })
+    .collect()
 }
 
 struct GeneratedResourceCallbacks {
@@ -975,6 +1110,9 @@ fn session_descriptor_tokens(
     Some(SessionResourceReceiver::OutputStream) => quote!(Some(
       napi_ohos_uniffi_engine::SessionResourceReceiver::OutputStream
     )),
+    Some(SessionResourceReceiver::InputStream) => quote!(Some(
+      napi_ohos_uniffi_engine::SessionResourceReceiver::InputStream
+    )),
   };
   let result_receiver = match operation_result_receiver(family_operation) {
     None => quote!(None),
@@ -984,13 +1122,36 @@ fn session_descriptor_tokens(
     Some(SessionResourceReceiver::OutputStream) => quote!(Some(
       napi_ohos_uniffi_engine::SessionResourceReceiver::OutputStream
     )),
+    Some(SessionResourceReceiver::InputStream) => quote!(Some(
+      napi_ohos_uniffi_engine::SessionResourceReceiver::InputStream
+    )),
   };
-  let native_call = if operation.arguments.iter().any(|argument| {
+  let has_argument_callbacks = family_operation.callbacks.iter().any(|use_site| {
     matches!(
-      argument.binding,
-      OhosArgumentBinding::CallbackProxy { .. } | OhosArgumentBinding::InputStreamProxy { .. }
+      use_site.path.segments().first(),
+      Some(ValuePathSegment::Argument(_))
     )
-  }) {
+  });
+  let callback_transfer = has_argument_callbacks
+    && family_operation.callbacks.iter().any(|use_site| {
+      matches!(
+        use_site.path.segments().first(),
+        Some(ValuePathSegment::Argument(_))
+      ) && use_site.contract.retention == CallbackRetention::Retained
+    });
+  let native_call = if has_argument_callbacks
+    || family_operation
+      .streams
+      .iter()
+      .any(|use_site| use_site.direction == StreamDirection::Input)
+    || operation.arguments.iter().any(|argument| {
+      matches!(
+        argument.binding,
+        OhosArgumentBinding::CallbackProxy { .. }
+          | OhosArgumentBinding::InputStreamProxy { .. }
+          | OhosArgumentBinding::LowerWithHost { .. }
+      )
+    }) {
     quote!(napi_ohos_uniffi_engine::SessionNativeCall::HostAndArguments)
   } else {
     quote!(napi_ohos_uniffi_engine::SessionNativeCall::ArgumentsOnly)
@@ -999,12 +1160,16 @@ fn session_descriptor_tokens(
     .callbacks
     .iter()
     .map(|use_site| {
-      let [ValuePathSegment::Argument(argument_index)] = use_site.path.segments() else {
+      let path_tokens = session_path_tokens(&use_site.path);
+      if !matches!(
+        use_site.path.segments().first(),
+        Some(ValuePathSegment::Argument(_)) | Some(ValuePathSegment::Return)
+      ) {
         return Err(OhosEngineError::Codegen(format!(
           "unsupported callback path for operation {operation_id}: {}",
           use_site.path
         )));
-      };
+      }
       let callback_type_id = use_site.callback_type_id;
       let retention = match use_site.contract.retention {
         CallbackRetention::Scoped => {
@@ -1032,7 +1197,7 @@ fn session_descriptor_tokens(
       };
       Ok(quote! {
         napi_ohos_uniffi_engine::SessionCallbackArgument {
-          argument_index: #argument_index,
+          path: vec![#(#path_tokens),*],
           callback_type_id: #callback_type_id,
           retention: #retention,
           threading: #threading,
@@ -1046,15 +1211,21 @@ fn session_descriptor_tokens(
     .iter()
     .filter(|use_site| use_site.direction == StreamDirection::Input)
     .map(|use_site| {
-      let [ValuePathSegment::Argument(argument_index)] = use_site.path.segments() else {
+      if !matches!(
+        use_site.path.segments().first(),
+        Some(ValuePathSegment::Argument(_))
+      ) {
         return Err(OhosEngineError::Codegen(format!(
           "unsupported input-stream path for operation {operation_id}: {}",
           use_site.path
         )));
-      };
+      }
+      let path_tokens = session_path_tokens(&use_site.path);
+      let use_site_id = use_site.use_site_id;
       Ok(quote! {
         napi_ohos_uniffi_engine::SessionStreamArgument {
-          argument_index: #argument_index,
+          path: vec![#(#path_tokens),*],
+          use_site_id: #use_site_id,
           direction: napi_ohos_uniffi_engine::SessionStreamDirection::Input,
         }
       })
@@ -1066,7 +1237,8 @@ fn session_descriptor_tokens(
       callback: #callback,
       native_call: #native_call,
       receiver: #receiver,
-      result_receiver: #result_receiver,
+      result: #result_receiver,
+      callback_transfer: #callback_transfer,
       callback_arguments: vec![#(#callback_arguments),*],
       stream_arguments: vec![#(#stream_arguments),*],
     }
@@ -1082,6 +1254,11 @@ fn operation_receiver(
       OperationKind::OutputStreamNext | OperationKind::OutputStreamCancel
     ) {
       SessionResourceReceiver::OutputStream
+    } else if matches!(
+      operation.kind,
+      OperationKind::InputStreamPull | OperationKind::InputStreamCancel
+    ) {
+      SessionResourceReceiver::InputStream
     } else {
       SessionResourceReceiver::Object
     }
@@ -1153,6 +1330,9 @@ pub enum OhosEngineError {
     kind: OperationKind,
   },
   HostOperationHasRustBindings {
+    operation_id: u32,
+  },
+  HostOperationHasStructuredUseSites {
     operation_id: u32,
   },
   MissingObjectReceiver {
@@ -1261,6 +1441,10 @@ impl fmt::Display for OhosEngineError {
       Self::HostOperationHasRustBindings { operation_id } => write!(
         formatter,
         "host operation {operation_id} must not contain Rust call arguments or a receiver"
+      ),
+      Self::HostOperationHasStructuredUseSites { operation_id } => write!(
+        formatter,
+        "host operation {operation_id} must not contain callback or stream use-sites"
       ),
       Self::MissingObjectReceiver { operation_id } => {
         write!(

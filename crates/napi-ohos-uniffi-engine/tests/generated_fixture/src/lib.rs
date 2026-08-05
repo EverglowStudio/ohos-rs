@@ -209,6 +209,7 @@ use std::task::{Poll, Waker};
     host: Object<'static>,
     callback_type_id: u32,
     callback_id: u32,
+    invoker: SessionCallbackInvoker,
     lease: SessionCallbackLease,
   }
 
@@ -220,6 +221,7 @@ use std::task::{Poll, Waker};
     }
 
     fn call_napi(&self, value: u32, method_id: u32) -> napi_ohos::Result<u32> {
+      self.invoker.check_open()?;
       let env = self.host.value().env;
       let name = CString::new("invokeCallbackSync")?;
       let mut function = ptr::null_mut();
@@ -250,7 +252,7 @@ use std::task::{Poll, Waker};
     callback_type_id: u32,
     callback_id: u32,
     contract: SessionCallbackArgument,
-    _invoker: SessionCallbackInvoker,
+    invoker: SessionCallbackInvoker,
     lease: SessionCallbackLease,
   ) -> napi_ohos::Result<SyncObserverProxy> {
     if contract.retention != SessionCallbackRetention::Retained
@@ -265,6 +267,7 @@ use std::task::{Poll, Waker};
       host: *host,
       callback_type_id,
       callback_id,
+      invoker,
       lease,
     })
   }

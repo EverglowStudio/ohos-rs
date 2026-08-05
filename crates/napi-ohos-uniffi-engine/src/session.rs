@@ -24,6 +24,10 @@ use napi_ohos::{sys, Env, Error, Result, Status};
 /// deadline (or the N-API finalizer) detaches the state.
 struct LifecycleGate {
   env: sys::napi_env,
+  /// Raw Ark N-API references may only be touched on the thread owning the
+  /// environment.  The marker lets callback invokers reject an off-thread
+  /// returned retain before resolving the state pointer.
+  owner_thread: std::thread::ThreadId,
   state: AtomicPtr<SessionState>,
   detached: AtomicBool,
   /// Callback proxies may outlive the public session object. Revoke their
@@ -74,6 +78,7 @@ impl LifecycleGate {
   fn new(env: sys::napi_env) -> Arc<Self> {
     Arc::new(Self {
       env,
+      owner_thread: std::thread::current().id(),
       state: AtomicPtr::new(ptr::null_mut()),
       detached: AtomicBool::new(false),
       invocations_open: AtomicBool::new(true),
@@ -245,6 +250,17 @@ impl LifecycleGate {
   fn invocations_are_open(&self) -> bool {
     self.invocations_open.load(Ordering::Acquire) && !self.detached.load(Ordering::Acquire)
   }
+
+  fn ensure_owner_thread(&self) -> Result<()> {
+    if std::thread::current().id() == self.owner_thread {
+      Ok(())
+    } else {
+      Err(Error::new(
+        Status::GenericFailure,
+        "UniFFI callback invoker must run on the owning ArkVM thread",
+      ))
+    }
+  }
 }
 
 // N-API callback contexts are only entered on their owning JS environment
@@ -305,6 +321,46 @@ impl SessionCallbackInvoker {
         gate,
       }),
     }
+  }
+
+  /// Check that a callback proxy may enter the Host without allocating an
+  /// invocation ID. Synchronous callback methods call this on every entry.
+  pub fn check_open(&self) -> Result<()> {
+    self.inner.gate.ensure_owner_thread()?;
+    if !self.inner.gate.invocations_are_open() {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "UniFFI callback invoker is closed",
+      ));
+    }
+    Ok(())
+  }
+
+  /// Retain a callback returned by a callback method on the owning ArkVM
+  /// thread. The lease is backed by the existing SessionState registry and
+  /// release queue; only the Arc token crosses to a native worker.
+  pub fn retain_returned_callback(
+    &self,
+    callback_type_id: u32,
+    callback_id: u32,
+  ) -> Result<SessionCallbackLease> {
+    self.check_open()?;
+    let state = self.inner.gate.state_ptr();
+    if state.is_null() || !self.inner.gate.invocations_are_open() {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "UniFFI callback invoker is closed",
+      ));
+    }
+    // Safety: install_state publishes this pointer and detach clears it
+    // before state-owned Ark references are released. The open/thread checks
+    // above prevent dereferencing a revoked state; new_callback_lease repeats
+    // the check around the Host hook for a close/reentrancy race.
+    let state = unsafe { &*state };
+    state.new_callback_lease(CallbackKey {
+      callback_type_id,
+      callback_id,
+    })
   }
 
   /// Allocate a session-local async callback invocation ID. The lifecycle
@@ -479,16 +535,6 @@ impl CallbackReleaseQueue {
       // remain in `pending` until that callback drains them.
       let _ = status;
     }
-  }
-
-  fn enqueue(&self, key: CallbackKey) {
-    self
-      .state
-      .lock()
-      .expect("callback release queue poisoned")
-      .pending
-      .push(key);
-    self.wake();
   }
 
   fn install(&self, tsfn: sys::napi_threadsafe_function) -> bool {
@@ -1296,22 +1342,16 @@ impl SessionState {
   }
 
   fn new_callback_lease(&self, key: CallbackKey) -> Result<SessionCallbackLease> {
+    self.callback_invoker.check_open()?;
     let callback_type = js_u32(self.env, key.callback_type_id)?;
     let callback_id = js_u32(self.env, key.callback_id)?;
-    if let Err(error) = self.call_host("retainCallback", &[callback_type, callback_id]) {
-      // A host retain hook may have side effects before reporting an error.
-      // Balance every attempted retain during rollback, even though no lease
-      // object can be returned to the generated lowerer.
-      self.callback_release_queue.enqueue(key);
-      clear_pending_exception(self.env);
-      return Err(error);
-    }
+    // Register the logical token before entering user Host code. A
+    // re-entrant close can claim and drain this token while retainCallback is
+    // running; the post-hook check then observes revocation without a second
+    // release.
     let token = match self.callback_release_queue.register(key) {
       Ok(token) => token,
       Err(error) => {
-        // Balance a successful retain if the logical lease registry is
-        // exhausted before an Arc can be created.
-        self.callback_release_queue.enqueue(key);
         clear_pending_exception(self.env);
         return Err(error);
       }
@@ -1325,6 +1365,20 @@ impl SessionState {
       .callback_leases
       .borrow_mut()
       .push(Arc::downgrade(&lease.inner));
+    if let Err(error) = self.call_host("retainCallback", &[callback_type, callback_id]) {
+      // A host retain hook may have side effects before reporting an error;
+      // claim the pre-registered token so the attempted retain is balanced.
+      clear_pending_exception(self.env);
+      lease.inner.release();
+      return Err(error);
+    }
+    if let Err(error) = self.callback_invoker.check_open() {
+      // retainCallback may synchronously trigger lifecycle teardown. The
+      // token is either claimed by close or by this release, never both.
+      clear_pending_exception(self.env);
+      lease.inner.release();
+      return Err(error);
+    }
     Ok(lease)
   }
 
@@ -2673,6 +2727,7 @@ impl SessionState {
       host_args.push(js_u32(self.env, invocation_id)?);
       "invokeCallbackAsync"
     } else {
+      self.callback_invoker.check_open()?;
       "invokeCallbackSync"
     };
     host_args.push(callback_args);
@@ -5229,5 +5284,51 @@ mod callback_invoker_tests {
     gate.invalidate_invocations();
     assert!(first.next_invocation_id().is_err());
     assert!(second.next_invocation_id().is_err());
+  }
+
+  #[test]
+  fn check_open_does_not_consume_invocation_id_and_rejects_off_thread() {
+    let gate = LifecycleGate::new(ptr::null_mut());
+    let invoker = SessionCallbackInvoker::new(gate.clone());
+    invoker.check_open().unwrap();
+    assert_eq!(invoker.next_invocation_id().unwrap(), 0);
+
+    let off_thread_invoker = invoker.clone();
+    let off_thread = std::thread::spawn(move || off_thread_invoker.check_open().is_err());
+    assert!(off_thread.join().unwrap());
+
+    gate.invalidate_invocations();
+    assert!(invoker.check_open().is_err());
+  }
+
+  #[test]
+  fn callback_lease_drop_claims_one_logical_release() {
+    let queue = Arc::new(CallbackReleaseQueue {
+      state: Mutex::new(CallbackReleaseState {
+        next_token: 0,
+        active: BTreeMap::new(),
+        pending: Vec::new(),
+      }),
+      tsfn: AtomicPtr::new(ptr::null_mut()),
+      tsfn_guard: Mutex::new(()),
+      closed: AtomicBool::new(true),
+    });
+    let token = queue
+      .register(CallbackKey {
+        callback_type_id: 7,
+        callback_id: 11,
+      })
+      .unwrap();
+    let first = SessionCallbackLease {
+      inner: Arc::new(CallbackLeaseInner {
+        token,
+        queue: queue.clone(),
+      }),
+    };
+    let second = first.clone();
+    drop(first);
+    drop(second);
+    assert_eq!(queue.take_pending().len(), 1);
+    assert!(queue.take_pending().is_empty());
   }
 }

@@ -8,6 +8,7 @@ use napi_family_core::{
   StreamDirection, StreamSlotIdentity, StreamUseSite, StreamValueBinding, ValuePath,
 };
 use proc_macro2::{Ident, Span};
+use quote::ToTokens;
 use std::sync::{Arc, Mutex};
 
 fn ident(name: &str) -> Ident {
@@ -407,6 +408,30 @@ fn structured_proxy_builders_map_bridge_errors_to_napi_errors() {
       "{builder} must map BridgeErrorDescriptor into napi_ohos::Error: {statement}"
     );
   }
+}
+
+#[test]
+fn structured_proxy_parameter_types_preserve_callback_trait_and_stream_shapes() {
+  let callback = OhosArgumentBinding::CallbackProxy {
+    rust_type: syn::parse_quote!(fixture::Callback),
+    build: syn::parse_quote!(fixture::build_callback),
+  };
+  assert_eq!(
+    callback.rust_parameter_type().to_token_stream().to_string(),
+    "std :: sync :: Arc < dyn fixture :: Callback >"
+  );
+
+  let input_stream = OhosArgumentBinding::InputStreamProxy {
+    rust_type: syn::parse_quote!(fixture::InputStream),
+    build: syn::parse_quote!(fixture::build_input_stream),
+  };
+  assert_eq!(
+    input_stream
+      .rust_parameter_type()
+      .to_token_stream()
+      .to_string(),
+    "fixture :: InputStream"
+  );
 }
 
 #[test]

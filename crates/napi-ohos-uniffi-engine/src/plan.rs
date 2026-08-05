@@ -65,9 +65,8 @@ impl OhosArgumentBinding {
 
   pub(crate) fn rust_parameter_type(&self) -> Type {
     match self {
-      Self::CallbackProxy { rust_type, .. } | Self::InputStreamProxy { rust_type, .. } => {
-        rust_type.clone()
-      }
+      Self::CallbackProxy { rust_type, .. } => syn::parse_quote!(std::sync::Arc<dyn #rust_type>),
+      Self::InputStreamProxy { rust_type, .. } => rust_type.clone(),
       _ => self.carrier_type(),
     }
   }

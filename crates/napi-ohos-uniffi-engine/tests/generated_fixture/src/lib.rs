@@ -5,6 +5,8 @@ mod generated_fixture {
 use std::cell::RefCell;
 use std::ffi::CString;
 use std::future::poll_fn;
+use std::future::Future;
+use std::pin::Pin;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -55,7 +57,8 @@ use std::task::{Poll, Waker};
     // Keep one native callback proxy alive across an operation boundary so
     // the fixture proves retained leases follow proxy ownership rather than
     // being unconditionally released by the session at return.
-    static HELD_SYNC_OBSERVERS: RefCell<Vec<SyncObserverProxy>> = const { RefCell::new(Vec::new()) };
+    static HELD_SYNC_OBSERVERS: RefCell<Vec<Arc<dyn SyncObserverProxy>>> =
+      const { RefCell::new(Vec::new()) };
   }
 
   pub fn sync_echo(value: u32) -> u32 {
@@ -215,7 +218,11 @@ use std::task::{Poll, Waker};
     value.handle + 1
   }
 
-  pub struct SyncObserverProxy {
+  pub trait SyncObserverProxy {
+    fn call(&self, value: u32, method_id: u32) -> Result<u32, BridgeErrorDescriptor>;
+  }
+
+  struct SyncObserverProxyImpl {
     host: Object<'static>,
     callback_type_id: u32,
     callback_id: u32,
@@ -223,13 +230,15 @@ use std::task::{Poll, Waker};
     lease: SessionCallbackLease,
   }
 
-  impl SyncObserverProxy {
+  impl SyncObserverProxy for SyncObserverProxyImpl {
     fn call(&self, value: u32, method_id: u32) -> Result<u32, BridgeErrorDescriptor> {
       self.call_napi(value, method_id).map_err(|error| {
         BridgeErrorDescriptor::backend(format!("sync callback dispatch failed: {error}"))
       })
     }
+  }
 
+  impl SyncObserverProxyImpl {
     fn call_napi(&self, value: u32, method_id: u32) -> napi_ohos::Result<u32> {
       self.invoker.check_open()?;
       let env = self.host.value().env;
@@ -264,7 +273,7 @@ use std::task::{Poll, Waker};
     contract: SessionCallbackArgument,
     invoker: SessionCallbackInvoker,
     lease: SessionCallbackLease,
-  ) -> napi_ohos::Result<SyncObserverProxy> {
+  ) -> napi_ohos::Result<Arc<dyn SyncObserverProxy>> {
     if contract.retention != SessionCallbackRetention::Retained
       || contract.threading != SessionCallbackThreading::CallingThread
     {
@@ -273,22 +282,22 @@ use std::task::{Poll, Waker};
         "unexpected sync callback contract",
       ));
     }
-    Ok(SyncObserverProxy {
+    Ok(Arc::new(SyncObserverProxyImpl {
       host: *host,
       callback_type_id,
       callback_id,
       invoker,
       lease,
-    })
+    }))
   }
 
-  pub fn observe_sync(observer: SyncObserverProxy) -> Result<u32, BridgeErrorDescriptor> {
+  pub fn observe_sync(observer: Arc<dyn SyncObserverProxy>) -> Result<u32, BridgeErrorDescriptor> {
     let fallible = observer.call(5, 1)?;
     let infallible = observer.call(6, 3)?;
     Ok(fallible + infallible)
   }
 
-  pub fn hold_sync_observer(observer: SyncObserverProxy) -> u32 {
+  pub fn hold_sync_observer(observer: Arc<dyn SyncObserverProxy>) -> u32 {
     HELD_SYNC_OBSERVERS.with(|held| held.borrow_mut().push(observer));
     0
   }
@@ -302,7 +311,15 @@ use std::task::{Poll, Waker};
   type AsyncCallbackTsfn =
     ThreadsafeFunction<AsyncCallbackArgs, Promise<u32>, AsyncCallbackArgs, Status, false>;
 
-  pub struct AsyncObserverProxy {
+  pub trait AsyncObserverProxy: Send + Sync {
+    fn call<'a>(
+      &'a self,
+      value: u32,
+      method_id: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<u32, napi_ohos::Error>> + Send + 'a>>;
+  }
+
+  struct AsyncObserverProxyImpl {
     callback_type_id: u32,
     callback_id: u32,
     callback: Arc<AsyncCallbackTsfn>,
@@ -317,7 +334,7 @@ use std::task::{Poll, Waker};
     contract: SessionCallbackArgument,
     invoker: SessionCallbackInvoker,
     lease: SessionCallbackLease,
-  ) -> napi_ohos::Result<AsyncObserverProxy> {
+  ) -> napi_ohos::Result<Arc<dyn AsyncObserverProxy>> {
     if contract.retention != SessionCallbackRetention::Retained
       || contract.threading != SessionCallbackThreading::CallingThread
     {
@@ -339,16 +356,16 @@ use std::task::{Poll, Waker};
       ?
       .build_threadsafe_function()
       .build()?;
-    Ok(AsyncObserverProxy {
+    Ok(Arc::new(AsyncObserverProxyImpl {
       callback_type_id,
       callback_id,
       callback: Arc::new(callback),
       invoker,
       lease,
-    })
+    }))
   }
 
-  pub async fn observe_async(observer: AsyncObserverProxy) -> u32 {
+  pub async fn observe_async(observer: Arc<dyn AsyncObserverProxy>) -> u32 {
     let fallible = observer
       .call(5, 0)
       .await
@@ -360,8 +377,8 @@ use std::task::{Poll, Waker};
     fallible + infallible
   }
 
-  impl AsyncObserverProxy {
-    async fn call(&self, value: u32, method_id: u32) -> Result<u32, napi_ohos::Error> {
+  impl AsyncObserverProxyImpl {
+    async fn call_inner(&self, value: u32, method_id: u32) -> Result<u32, napi_ohos::Error> {
       let invocation = self
         .callback
         .call_async(AsyncCallbackArgs::from((
@@ -381,7 +398,27 @@ use std::task::{Poll, Waker};
     }
   }
 
-  pub struct StreamFactoryProxy(Object<'static>);
+  impl AsyncObserverProxy for AsyncObserverProxyImpl {
+    fn call<'a>(
+      &'a self,
+      value: u32,
+      method_id: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<u32, napi_ohos::Error>> + Send + 'a>> {
+      Box::pin(self.call_inner(value, method_id))
+    }
+  }
+
+  pub trait StreamFactoryProxy {
+    fn host(&self) -> Object<'static>;
+  }
+
+  struct StreamFactoryProxyImpl(Object<'static>);
+
+  impl StreamFactoryProxy for StreamFactoryProxyImpl {
+    fn host(&self) -> Object<'static> {
+      self.0
+    }
+  }
 
   pub fn build_stream_factory(
     host: &Object<'static>,
@@ -389,7 +426,7 @@ use std::task::{Poll, Waker};
     _callback_id: u32,
     contract: SessionCallbackArgument,
     _invoker: SessionCallbackInvoker,
-  ) -> napi_ohos::Result<StreamFactoryProxy> {
+  ) -> napi_ohos::Result<Arc<dyn StreamFactoryProxy>> {
     if contract.threading != SessionCallbackThreading::CallingThread
     {
       return Err(napi_ohos::Error::new(
@@ -407,11 +444,11 @@ use std::task::{Poll, Waker};
     STREAM_LATE_ITEM_STEPS.get_or_init(|| {
       Mutex::new(vec![make_stream_step("item", "value", 3001)])
     });
-    Ok(StreamFactoryProxy(*host))
+    Ok(Arc::new(StreamFactoryProxyImpl(*host)))
   }
 
-  pub fn open_stream(proxy: StreamFactoryProxy) -> Object<'static> {
-    proxy.0
+  pub fn open_stream(proxy: Arc<dyn StreamFactoryProxy>) -> Object<'static> {
+    proxy.host()
   }
 
   pub fn lift_stream(value: Object<'static>) -> Result<Object<'static>, BridgeErrorDescriptor> {

@@ -387,6 +387,29 @@ fn structured_family_preserves_callback_method_ids_and_stream_contracts() {
 }
 
 #[test]
+fn structured_proxy_builders_map_bridge_errors_to_napi_errors() {
+  let family = callback_family();
+  let source = generate_ohos_source(&family, callback_plan(&family))
+    .unwrap()
+    .source()
+    .to_string();
+
+  for builder in ["fixture :: build_callback", "fixture :: build_input_stream"] {
+    let invocation = source
+      .find(builder)
+      .unwrap_or_else(|| panic!("generated source does not call {builder}"));
+    let relative_end = source[invocation..]
+      .find(';')
+      .expect("proxy builder invocation has a terminating semicolon");
+    let statement = &source[invocation..invocation + relative_end];
+    assert!(
+      statement.contains("map_err (| error | napi_ohos :: Error :: new"),
+      "{builder} must map BridgeErrorDescriptor into napi_ohos::Error: {statement}"
+    );
+  }
+}
+
+#[test]
 fn scoped_callback_builder_receives_invoker_without_lease() {
   let family = family(vec![{
     let mut operation = operation(

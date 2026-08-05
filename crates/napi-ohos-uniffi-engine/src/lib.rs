@@ -861,7 +861,10 @@ fn generate_operation(
               #contract,
               __uniffi_callback_invoker.clone(),
               __uniffi_callback_lease,
-            )?;
+            ).map_err(|error| napi_ohos::Error::new(
+              napi_ohos::Status::GenericFailure,
+              error.to_string(),
+            ))?;
           });
         } else {
           pre_call.extend(quote! {
@@ -871,7 +874,10 @@ fn generate_operation(
               #wrapper_name,
               #contract,
               __uniffi_callback_invoker.clone(),
-            )?;
+            ).map_err(|error| napi_ohos::Error::new(
+              napi_ohos::Status::GenericFailure,
+              error.to_string(),
+            ))?;
           });
         }
       }
@@ -895,7 +901,11 @@ fn generate_operation(
           Span::call_site(),
         );
         pre_call.extend(quote! {
-          let #wrapper_name = #build(&#host_arg, #wrapper_name)?;
+          let #wrapper_name = #build(&#host_arg, #wrapper_name)
+            .map_err(|error| napi_ohos::Error::new(
+              napi_ohos::Status::GenericFailure,
+              error.to_string(),
+            ))?;
         });
       }
     }

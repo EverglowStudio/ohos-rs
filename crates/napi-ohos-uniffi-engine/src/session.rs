@@ -788,6 +788,8 @@ pub struct SessionCallbackArgument {
 pub enum SessionValuePathSegment {
   Argument(u32),
   Return,
+  StreamItem,
+  StreamError,
   Field(String),
   Variant(String),
   Optional,
@@ -1317,6 +1319,11 @@ impl SessionState {
         match segment {
           SessionValuePathSegment::Field(name) => {
             next.push(named_property(self.env, value, name)?);
+          }
+          SessionValuePathSegment::StreamItem | SessionValuePathSegment::StreamError => {
+            if let Some(value) = stream_step_payload(self.env, value, segment, role)? {
+              next.push(value);
+            }
           }
           SessionValuePathSegment::Variant(name) => {
             if let Some(value) = resolve_variant(self.env, value, name)? {
@@ -3930,6 +3937,104 @@ fn is_null_value(env: sys::napi_env, value: sys::napi_value) -> Result<bool> {
   Ok(value_type == sys::ValueType::napi_null)
 }
 
+/// Resolve one branch of the canonical output-stream step carrier. A valid
+/// non-selected branch is skipped; malformed own-key shapes are protocol
+/// errors and therefore follow the caller's existing rollback path.
+fn stream_step_payload(
+  env: sys::napi_env,
+  value: sys::napi_value,
+  selector: &SessionValuePathSegment,
+  role: &str,
+) -> Result<Option<sys::napi_value>> {
+  let mut value_type = sys::ValueType::napi_undefined;
+  napi_ohos::check_status!(unsafe { sys::napi_typeof(env, value, &mut value_type) })?;
+  if value_type != sys::ValueType::napi_object {
+    return Err(Error::new(
+      Status::InvalidArg,
+      format!("{role} stream step must be an object"),
+    ));
+  }
+  let keys = own_string_keys(env, value)?;
+  if !keys.contains("kind") {
+    return Err(Error::new(
+      Status::InvalidArg,
+      format!("{role} stream step is missing its own kind key"),
+    ));
+  }
+  let kind = string_value(env, named_property(env, value, "kind")?)?.ok_or_else(|| {
+    Error::new(
+      Status::InvalidArg,
+      format!("{role} stream step kind must be a string"),
+    )
+  })?;
+  let (expected_keys, payload_key, branch_matches) = match kind.as_str() {
+    "item" => (
+      ["kind", "value"].as_slice(),
+      Some("value"),
+      matches!(selector, SessionValuePathSegment::StreamItem),
+    ),
+    "done" => (["kind"].as_slice(), None, false),
+    "error" => (
+      ["kind", "error"].as_slice(),
+      Some("error"),
+      matches!(selector, SessionValuePathSegment::StreamError),
+    ),
+    _ => {
+      return Err(Error::new(
+        Status::InvalidArg,
+        format!("{role} stream step has an unknown kind"),
+      ))
+    }
+  };
+  if keys.len() != expected_keys.len() || expected_keys.iter().any(|key| !keys.contains(*key)) {
+    return Err(Error::new(
+      Status::InvalidArg,
+      format!("{role} stream step has an invalid own-key shape"),
+    ));
+  }
+  if !branch_matches {
+    return Ok(None);
+  }
+  Ok(
+    payload_key
+      .map(|key| named_property(env, value, key))
+      .transpose()?,
+  )
+}
+
+/// Return the complete own string-key set, including non-enumerable keys, so
+/// stream carriers cannot smuggle a second payload through an inherited or
+/// hidden property. Symbols are excluded because the canonical DTO contract
+/// has only the string keys listed by `stream_step_payload`.
+fn own_string_keys(env: sys::napi_env, object: sys::napi_value) -> Result<BTreeSet<String>> {
+  let mut properties = ptr::null_mut();
+  napi_ohos::check_status!(unsafe {
+    sys::napi_get_all_property_names(
+      env,
+      object,
+      sys::KeyCollectionMode::own_only,
+      sys::KeyFilter::all_properties | sys::KeyFilter::skip_symbols,
+      sys::KeyConversion::numbers_to_strings,
+      &mut properties,
+    )
+  })?;
+  let mut length = 0;
+  napi_ohos::check_status!(unsafe { sys::napi_get_array_length(env, properties, &mut length) })?;
+  let mut keys = BTreeSet::new();
+  for index in 0..length {
+    let mut key = ptr::null_mut();
+    napi_ohos::check_status!(unsafe { sys::napi_get_element(env, properties, index, &mut key) })?;
+    let Some(key) = string_value(env, key)? else {
+      return Err(Error::new(
+        Status::InvalidArg,
+        "stream step own key must be a string",
+      ));
+    };
+    keys.insert(key);
+  }
+  Ok(keys)
+}
+
 /// Return-path walker used after the lifecycle gate has detached.  It is
 /// deliberately independent of SessionState: only a return root is accepted
 /// and all selectors retain the same fan-out/optional semantics as the live
@@ -3951,6 +4056,11 @@ fn detached_result_values(
     for value in values {
       match segment {
         SessionValuePathSegment::Field(name) => next.push(named_property(env, value, name)?),
+        SessionValuePathSegment::StreamItem | SessionValuePathSegment::StreamError => {
+          if let Some(value) = stream_step_payload(env, value, segment, "late result resource")? {
+            next.push(value);
+          }
+        }
         SessionValuePathSegment::Variant(name) => {
           if let Some(value) = resolve_variant(env, value, name)? {
             next.push(value);

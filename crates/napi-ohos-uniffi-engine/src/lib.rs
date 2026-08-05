@@ -18,7 +18,7 @@ use napi_derive_backend_ohos::{NapiFn, NapiFnArg, NapiFnArgKind, NapiFnBuilder, 
 use napi_family_core::{
   AsyncKind, BigIntWords, CallbackReentrancy, CallbackRetention, CallbackThreading,
   CallbackUseSite, FamilyOperation, FamilyOperationTarget, FamilyPlan, FamilyPlanError,
-  OperationKind, StreamDirection, ValuePath, ValuePathSegment,
+  OperationKind, ReceiverBinding, StreamDirection, ValuePath, ValuePathSegment,
 };
 use napi_ohos::bindgen_prelude::{BigInt, ToNapiValue};
 use napi_ohos::{sys, Result as NapiResult};
@@ -26,6 +26,7 @@ use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
 
 pub use napi_family_core;
+pub use napi_family_core::{ClosePolicy, DeadlineAction};
 mod plan;
 pub use plan::*;
 mod session;
@@ -33,7 +34,7 @@ pub use session::{
   create_backend_session, take_session_callback_transfers, SessionCallbackArgument,
   SessionCallbackErrorStyle, SessionCallbackLease, SessionCallbackReentrancy,
   SessionCallbackRetention, SessionCallbackThreading, SessionCallbackTransfers, SessionNativeCall,
-  SessionOperationDescriptor, SessionOperationDispatch, SessionResourceCallbacks,
+  SessionOperationDescriptor, SessionOperationDispatch, SessionReceiver, SessionResourceCallbacks,
   SessionResourceReceiver, SessionStreamArgument, SessionStreamDirection, SessionValuePathSegment,
 };
 
@@ -485,6 +486,13 @@ pub fn generate_ohos_source(
     optional_callback_factory(resource_callbacks.cancel_output_stream.as_ref());
   let release_output_stream =
     optional_callback_factory(resource_callbacks.release_output_stream.as_ref());
+  let close_policy = family.close_policy();
+  let close_grace_ms = close_policy.grace_ms;
+  let close_on_deadline = match close_policy.on_deadline {
+    napi_family_core::DeadlineAction::Detach => {
+      quote!(napi_ohos_uniffi_engine::DeadlineAction::Detach)
+    }
+  };
   source.extend(quote! {
     #[doc(hidden)]
     fn #factory(
@@ -494,6 +502,10 @@ pub fn generate_ohos_source(
       napi_ohos_uniffi_engine::create_backend_session(
         env,
         host,
+        napi_ohos_uniffi_engine::ClosePolicy {
+          grace_ms: #close_grace_ms,
+          on_deadline: #close_on_deadline,
+        },
         vec![#(#descriptors),*],
         napi_ohos_uniffi_engine::SessionResourceCallbacks {
           release_object: #release_object,
@@ -580,7 +592,25 @@ fn generate_operation(
           | OhosArgumentBinding::InputStreamProxy { .. }
           | OhosArgumentBinding::LowerWithHost { .. }
       )
+    })
+    || operation.receiver.as_ref().is_some_and(|receiver| {
+      matches!(&receiver.binding, OhosArgumentBinding::LowerWithHost { .. })
     });
+  let value_receiver_requires_sync_lower = matches!(family.receiver, Some(ReceiverBinding::Value))
+    && matches!(
+      operation
+        .receiver
+        .as_ref()
+        .map(|receiver| &receiver.binding),
+      Some(
+        OhosArgumentBinding::I64BigInt
+          | OhosArgumentBinding::U64BigInt
+          | OhosArgumentBinding::LowerWith { .. }
+          | OhosArgumentBinding::LowerWithHost { .. }
+      )
+    );
+  let manual_async_entry =
+    family.async_kind == AsyncKind::Async && (requires_host || value_receiver_requires_sync_lower);
 
   let mut builder = NapiFnBuilder::new(function_name.clone(), function_name.to_string());
   if requires_host {
@@ -588,6 +618,12 @@ fn generate_operation(
       kind: NapiFnArgKind::PatType(Box::new(syn::parse_quote!(
         __uniffi_host: napi_ohos::bindgen_prelude::Object<'static>
       ))),
+      ts_arg_type: None,
+    });
+  }
+  if manual_async_entry {
+    builder = builder.argument(NapiFnArg {
+      kind: NapiFnArgKind::PatType(Box::new(syn::parse_quote!(__uniffi_env: &napi_ohos::Env))),
       ts_arg_type: None,
     });
   }
@@ -602,6 +638,23 @@ fn generate_operation(
 
   let mut argument_names = Vec::with_capacity(operation.arguments.len() + 1);
   let mut lowerings = Vec::new();
+  let lower_error = |error: TokenStream| {
+    if manual_async_entry {
+      quote! {
+        {
+          let __uniffi_error_promise = napi_ohos::bindgen_prelude::PromiseRaw::<
+            napi_ohos_uniffi_engine::OhosCallResult<#return_carrier>
+          >::resolve(
+            __uniffi_env,
+            napi_ohos_uniffi_engine::OhosCallResult::Error(#error),
+          )?;
+          return Ok(napi_ohos::bindgen_prelude::JsValue::raw(&__uniffi_error_promise));
+        }
+      }
+    } else {
+      quote! { { return napi_ohos_uniffi_engine::OhosCallResult::Error(#error); } }
+    }
+  };
   if let Some(receiver) = &operation.receiver {
     let name = &receiver.name;
     let carrier_type = receiver.binding.carrier_type();
@@ -610,21 +663,58 @@ fn generate_operation(
       ts_arg_type: None,
     });
     argument_names.push(name.clone());
-    let lower = match &receiver.binding {
-      OhosArgumentBinding::ObjectLease { lower, .. }
-      | OhosArgumentBinding::OutputStreamLease { lower, .. } => lower,
-      _ => {
-        return Err(OhosEngineError::InvalidObjectReceiver {
-          operation_id: operation.operation_id,
-        })
+    match &receiver.binding {
+      OhosArgumentBinding::Direct { .. } => {}
+      OhosArgumentBinding::I64BigInt => {
+        let error = lower_error(quote!(
+          napi_ohos_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string())
+        ));
+        lowerings.push(quote! {
+          let (__uniffi_value, __uniffi_lossless) = #name.get_i64();
+          let #name = match napi_ohos_uniffi_engine::napi_family_core::require_lossless_i64(__uniffi_value, __uniffi_lossless) {
+            Ok(value) => value,
+            Err(error) => #error,
+          };
+        });
       }
-    };
-    lowerings.push(quote! {
-      let #name = match #lower(#name) {
-        Ok(value) => value,
-        Err(error) => return napi_ohos_uniffi_engine::OhosCallResult::Error(error),
-      };
-    });
+      OhosArgumentBinding::U64BigInt => {
+        let error = lower_error(quote!(
+          napi_ohos_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string())
+        ));
+        lowerings.push(quote! {
+          let (__uniffi_negative, __uniffi_value, __uniffi_lossless) = #name.get_u64();
+          let #name = match napi_ohos_uniffi_engine::napi_family_core::require_lossless_u64(__uniffi_negative, __uniffi_value, __uniffi_lossless) {
+            Ok(value) => value,
+            Err(error) => #error,
+          };
+        });
+      }
+      OhosArgumentBinding::LowerWith { lower, .. }
+      | OhosArgumentBinding::ObjectLease { lower, .. }
+      | OhosArgumentBinding::OutputStreamLease { lower, .. } => {
+        let error = lower_error(quote!(error));
+        lowerings.push(quote! {
+          let #name = match #lower(#name) {
+            Ok(value) => value,
+            Err(error) => #error,
+          };
+        });
+      }
+      OhosArgumentBinding::LowerWithHost { lower, .. } => {
+        let error = lower_error(quote!(error));
+        lowerings.push(quote! {
+          let #name = match #lower(&__uniffi_host, #name, &__uniffi_callback_transfers) {
+            Ok(value) => value,
+            Err(error) => #error,
+          };
+        });
+      }
+      OhosArgumentBinding::CallbackProxy { .. } | OhosArgumentBinding::InputStreamProxy { .. } => {
+        return Err(OhosEngineError::InvalidResourceReceiver {
+          operation_id: operation.operation_id,
+        });
+      }
+    }
   }
 
   let mut lowerings = lowerings;
@@ -657,7 +747,7 @@ fn generate_operation(
   } else if operation
     .arguments
     .iter()
-    .any(|argument| matches!(argument.binding, OhosArgumentBinding::LowerWithHost { .. }))
+    .any(|argument| matches!(&argument.binding, OhosArgumentBinding::LowerWithHost { .. }))
   {
     pre_call.extend(quote! {
       let __uniffi_callback_transfers =
@@ -674,39 +764,41 @@ fn generate_operation(
     argument_names.push(name.clone());
     match &argument.binding {
       OhosArgumentBinding::Direct { .. } => {}
-      OhosArgumentBinding::I64BigInt => lowerings.push(quote! {
-        let (__uniffi_value, __uniffi_lossless) = #name.get_i64();
-        let #name = match napi_ohos_uniffi_engine::napi_family_core::require_lossless_i64(
-          __uniffi_value,
-          __uniffi_lossless,
-        ) {
-          Ok(value) => value,
-          Err(error) => return napi_ohos_uniffi_engine::OhosCallResult::Error(
-            napi_ohos_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()),
-          ),
-        };
-      }),
-      OhosArgumentBinding::U64BigInt => lowerings.push(quote! {
-        let (__uniffi_negative, __uniffi_value, __uniffi_lossless) = #name.get_u64();
-        let #name = match napi_ohos_uniffi_engine::napi_family_core::require_lossless_u64(
-          __uniffi_negative,
-          __uniffi_value,
-          __uniffi_lossless,
-        ) {
-          Ok(value) => value,
-          Err(error) => return napi_ohos_uniffi_engine::OhosCallResult::Error(
-            napi_ohos_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string()),
-          ),
-        };
-      }),
+      OhosArgumentBinding::I64BigInt => {
+        let error = lower_error(quote!(
+          napi_ohos_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string())
+        ));
+        lowerings.push(quote! {
+          let (__uniffi_value, __uniffi_lossless) = #name.get_i64();
+          let #name = match napi_ohos_uniffi_engine::napi_family_core::require_lossless_i64(__uniffi_value, __uniffi_lossless) {
+            Ok(value) => value,
+            Err(error) => #error,
+          };
+        });
+      }
+      OhosArgumentBinding::U64BigInt => {
+        let error = lower_error(quote!(
+          napi_ohos_uniffi_engine::BridgeErrorDescriptor::validation(error.to_string())
+        ));
+        lowerings.push(quote! {
+          let (__uniffi_negative, __uniffi_value, __uniffi_lossless) = #name.get_u64();
+          let #name = match napi_ohos_uniffi_engine::napi_family_core::require_lossless_u64(__uniffi_negative, __uniffi_value, __uniffi_lossless) {
+            Ok(value) => value,
+            Err(error) => #error,
+          };
+        });
+      }
       OhosArgumentBinding::LowerWith { lower, .. }
       | OhosArgumentBinding::ObjectLease { lower, .. }
-      | OhosArgumentBinding::OutputStreamLease { lower, .. } => lowerings.push(quote! {
-        let #name = match #lower(#name) {
-          Ok(value) => value,
-          Err(error) => return napi_ohos_uniffi_engine::OhosCallResult::Error(error),
-        };
-      }),
+      | OhosArgumentBinding::OutputStreamLease { lower, .. } => {
+        let error = lower_error(quote!(error));
+        lowerings.push(quote! {
+          let #name = match #lower(#name) {
+            Ok(value) => value,
+            Err(error) => #error,
+          };
+        });
+      }
       OhosArgumentBinding::LowerWithHost { lower, .. } => {
         let wrapper_name = Ident::new(
           &format!("arg{}", first_operation_arg + argument_index),
@@ -816,6 +908,15 @@ fn generate_operation(
       };
     },
   };
+  let value_manual = match &operation.error_binding {
+    OhosErrorBinding::Infallible => quote!(let __uniffi_value = #invoke;),
+    OhosErrorBinding::Descriptor { map } => quote! {
+      let __uniffi_value = match #invoke {
+        Ok(value) => value,
+        Err(error) => return Ok(napi_ohos_uniffi_engine::OhosCallResult::Error(#map(error))),
+      };
+    },
+  };
   let lift = match &operation.return_binding {
     OhosReturnBinding::Unit | OhosReturnBinding::Direct { .. } => quote!(__uniffi_value),
     OhosReturnBinding::I64BigInt | OhosReturnBinding::U64BigInt => quote!({
@@ -835,7 +936,25 @@ fn generate_operation(
       }
     }),
   };
-  let async_token = (family.async_kind == AsyncKind::Async).then(|| quote!(async));
+  let lift_manual = match &operation.return_binding {
+    OhosReturnBinding::Unit | OhosReturnBinding::Direct { .. } => quote!(__uniffi_value),
+    OhosReturnBinding::I64BigInt | OhosReturnBinding::U64BigInt => quote!({
+      let parts = napi_ohos_uniffi_engine::napi_family_core::BigIntWords::from(__uniffi_value);
+      napi_ohos::bindgen_prelude::BigInt {
+        sign_bit: parts.negative,
+        words: parts.words,
+      }
+    }),
+    OhosReturnBinding::LiftWith { lift, .. }
+    | OhosReturnBinding::ObjectLease { lift, .. }
+    | OhosReturnBinding::CallbackLease { lift, .. }
+    | OhosReturnBinding::OutputStreamLease { lift, .. } => quote!({
+      match #lift(__uniffi_value) {
+        Ok(value) => value,
+        Err(error) => return Ok(napi_ohos_uniffi_engine::OhosCallResult::Error(error)),
+      }
+    }),
+  };
   let receiver_declaration = operation.receiver.iter().map(|receiver| {
     let name = &receiver.name;
     let ty = receiver.binding.rust_parameter_type();
@@ -846,30 +965,96 @@ fn generate_operation(
     let ty = argument.binding.rust_parameter_type();
     quote!(#name: #ty)
   });
-  let body = quote! {
-    #[doc(hidden)]
-    #[allow(clippy::all)]
-    #async_token fn #function_name(
-      #(#receiver_declaration)*
-      #(#argument_declarations),*
-    ) -> napi_ohos_uniffi_engine::OhosCallResult<#return_carrier> {
-      #(#lowerings)*
-      #value
-      napi_ohos_uniffi_engine::OhosCallResult::Value(#lift)
+  let host_declaration =
+    requires_host.then(|| quote!(__uniffi_host: napi_ohos::bindgen_prelude::Object<'static>,));
+  let env_declaration = manual_async_entry.then(|| quote!(__uniffi_env: &napi_ohos::Env,));
+  let transfer_declaration = callback_transfer.then(|| {
+    quote! {
+      __uniffi_session_generation: u32,
+      __uniffi_callback_transfer: u32,
+    }
+  });
+  let keep_host_alive = quote!();
+  let callback_transfers = quote! {
+    let __uniffi_callback_transfers =
+      napi_ohos_uniffi_engine::SessionCallbackTransfers::empty();
+  };
+  let body_host_declaration = if manual_async_entry {
+    host_declaration.clone()
+  } else {
+    None
+  };
+  let body_transfer_declaration = if manual_async_entry {
+    transfer_declaration.clone()
+  } else {
+    None
+  };
+  let async_token = (family.async_kind == AsyncKind::Async).then(|| quote!(async));
+  let body = if manual_async_entry {
+    quote! {
+      #[doc(hidden)]
+      #[allow(clippy::all)]
+      fn #function_name(
+        #host_declaration
+        #env_declaration
+        #transfer_declaration
+        #(#receiver_declaration)*
+        #(#argument_declarations),*
+      ) -> napi_ohos::Result<napi_ohos::bindgen_prelude::sys::napi_value> {
+        #callback_transfers
+        #(#lowerings)*
+        let __uniffi_future = async move {
+          #value_manual
+          Ok::<napi_ohos_uniffi_engine::OhosCallResult<#return_carrier>, napi_ohos::Error>(
+            napi_ohos_uniffi_engine::OhosCallResult::Value(#lift_manual)
+          )
+        };
+        let __uniffi_promise = __uniffi_env.spawn_future(__uniffi_future)?;
+        Ok(napi_ohos::bindgen_prelude::JsValue::raw(&__uniffi_promise))
+      }
+    }
+  } else {
+    quote! {
+      #[doc(hidden)]
+      #[allow(clippy::all)]
+      #async_token fn #function_name(
+        #body_host_declaration
+        #body_transfer_declaration
+        #(#receiver_declaration)*
+        #(#argument_declarations),*
+      ) -> napi_ohos_uniffi_engine::OhosCallResult<#return_carrier> {
+        #keep_host_alive
+        #callback_transfers
+        #(#lowerings)*
+        #value
+        napi_ohos_uniffi_engine::OhosCallResult::Value(#lift)
+      }
     }
   };
-  let function = builder
-    .return_type(syn::parse_quote!(
-      napi_ohos_uniffi_engine::OhosCallResult<#return_carrier>
-    ))
-    .pre_call(pre_call)
-    .leading_wrapper_args(wrapper_arg_count)
-    .asynchronous(family.async_kind == AsyncKind::Async)
-    .strict(true)
-    .skip_typescript(true)
-    .private(true)
-    .register_name(register_name)
-    .build();
+  let function = if manual_async_entry {
+    builder
+      .result_return_type(syn::parse_quote!(
+        napi_ohos::bindgen_prelude::sys::napi_value
+      ))
+      .pre_call(pre_call)
+      .asynchronous(false)
+      .strict(true)
+      .skip_typescript(true)
+      .private(true)
+      .register_name(register_name)
+      .build()
+  } else {
+    builder
+      .return_type(syn::parse_quote!(napi_ohos_uniffi_engine::OhosCallResult<#return_carrier>))
+      .pre_call(pre_call)
+      .leading_wrapper_args(wrapper_arg_count)
+      .asynchronous(family.async_kind == AsyncKind::Async)
+      .strict(true)
+      .skip_typescript(true)
+      .private(true)
+      .register_name(register_name)
+      .build()
+  };
   Ok(GeneratedOperation {
     body,
     function,
@@ -1104,15 +1289,24 @@ fn session_descriptor_tokens(
   };
   let receiver = match operation_receiver(family_operation) {
     None => quote!(None),
-    Some(SessionResourceReceiver::Object) => quote!(Some(
-      napi_ohos_uniffi_engine::SessionResourceReceiver::Object
-    )),
-    Some(SessionResourceReceiver::OutputStream) => quote!(Some(
-      napi_ohos_uniffi_engine::SessionResourceReceiver::OutputStream
-    )),
-    Some(SessionResourceReceiver::InputStream) => quote!(Some(
-      napi_ohos_uniffi_engine::SessionResourceReceiver::InputStream
-    )),
+    Some(session::SessionReceiver::Value) => {
+      quote!(Some(napi_ohos_uniffi_engine::SessionReceiver::Value))
+    }
+    Some(session::SessionReceiver::Resource(SessionResourceReceiver::Object)) => {
+      quote!(Some(napi_ohos_uniffi_engine::SessionReceiver::Resource(
+        napi_ohos_uniffi_engine::SessionResourceReceiver::Object
+      )))
+    }
+    Some(session::SessionReceiver::Resource(SessionResourceReceiver::OutputStream)) => {
+      quote!(Some(napi_ohos_uniffi_engine::SessionReceiver::Resource(
+        napi_ohos_uniffi_engine::SessionResourceReceiver::OutputStream
+      )))
+    }
+    Some(session::SessionReceiver::Resource(SessionResourceReceiver::InputStream)) => {
+      quote!(Some(napi_ohos_uniffi_engine::SessionReceiver::Resource(
+        napi_ohos_uniffi_engine::SessionResourceReceiver::InputStream
+      )))
+    }
   };
   let result_receiver = match operation_result_receiver(family_operation) {
     None => quote!(None),
@@ -1151,6 +1345,9 @@ fn session_descriptor_tokens(
           | OhosArgumentBinding::InputStreamProxy { .. }
           | OhosArgumentBinding::LowerWithHost { .. }
       )
+    })
+    || operation.receiver.as_ref().is_some_and(|receiver| {
+      matches!(&receiver.binding, OhosArgumentBinding::LowerWithHost { .. })
     }) {
     quote!(napi_ohos_uniffi_engine::SessionNativeCall::HostAndArguments)
   } else {
@@ -1247,22 +1444,18 @@ fn session_descriptor_tokens(
 
 fn operation_receiver(
   operation: &napi_family_core::FamilyOperation,
-) -> Option<SessionResourceReceiver> {
-  operation.receiver.as_ref().map(|_| {
-    if matches!(
-      operation.kind,
-      OperationKind::OutputStreamNext | OperationKind::OutputStreamCancel
-    ) {
-      SessionResourceReceiver::OutputStream
-    } else if matches!(
-      operation.kind,
-      OperationKind::InputStreamPull | OperationKind::InputStreamCancel
-    ) {
-      SessionResourceReceiver::InputStream
-    } else {
-      SessionResourceReceiver::Object
+) -> Option<session::SessionReceiver> {
+  match operation.receiver {
+    None => None,
+    Some(ReceiverBinding::Value) => Some(session::SessionReceiver::Value),
+    Some(ReceiverBinding::Resource(resource)) => {
+      Some(session::SessionReceiver::Resource(match resource.kind {
+        napi_family_core::ResourceKind::Object => SessionResourceReceiver::Object,
+        napi_family_core::ResourceKind::InputStream => SessionResourceReceiver::InputStream,
+        napi_family_core::ResourceKind::OutputStream => SessionResourceReceiver::OutputStream,
+      }))
     }
-  })
+  }
 }
 
 fn operation_result_receiver(
@@ -1270,6 +1463,7 @@ fn operation_result_receiver(
 ) -> Option<SessionResourceReceiver> {
   match operation.result.map(|resource| resource.kind) {
     Some(napi_family_core::ResourceKind::Object) => Some(SessionResourceReceiver::Object),
+    Some(napi_family_core::ResourceKind::InputStream) => Some(SessionResourceReceiver::InputStream),
     Some(napi_family_core::ResourceKind::OutputStream) => {
       Some(SessionResourceReceiver::OutputStream)
     }
@@ -1335,13 +1529,16 @@ pub enum OhosEngineError {
   HostOperationHasStructuredUseSites {
     operation_id: u32,
   },
-  MissingObjectReceiver {
+  MissingReceiver {
     operation_id: u32,
   },
-  UnexpectedObjectReceiver {
+  UnexpectedReceiver {
     operation_id: u32,
   },
-  InvalidObjectReceiver {
+  InvalidValueReceiver {
+    operation_id: u32,
+  },
+  InvalidResourceReceiver {
     operation_id: u32,
   },
   MissingStructuredUseSite {
@@ -1446,19 +1643,20 @@ impl fmt::Display for OhosEngineError {
         formatter,
         "host operation {operation_id} must not contain callback or stream use-sites"
       ),
-      Self::MissingObjectReceiver { operation_id } => {
-        write!(
-          formatter,
-          "object operation {operation_id} has no resource receiver"
-        )
+      Self::MissingReceiver { operation_id } => {
+        write!(formatter, "operation {operation_id} has no receiver")
       }
-      Self::UnexpectedObjectReceiver { operation_id } => write!(
+      Self::UnexpectedReceiver { operation_id } => write!(
         formatter,
-        "non-object operation {operation_id} unexpectedly has a resource receiver"
+        "operation {operation_id} unexpectedly has a receiver"
       ),
-      Self::InvalidObjectReceiver { operation_id } => write!(
+      Self::InvalidValueReceiver { operation_id } => write!(
         formatter,
-        "object operation {operation_id} requires a borrowed structured resource receiver"
+        "value operation {operation_id} requires a direct value receiver binding"
+      ),
+      Self::InvalidResourceReceiver { operation_id } => write!(
+        formatter,
+        "resource operation {operation_id} requires a structured resource receiver"
       ),
       Self::MissingStructuredUseSite {
         operation_id,
@@ -2031,15 +2229,24 @@ impl<H: OhosHost> OhosBackendSession<H> {
         state.input_streams.insert(*id);
       }
     }
-    if operation.receiver.is_some() {
-      if let Some(OhosValue::Object(id) | OhosValue::OutputStream(id)) = args.first() {
-        if operation.kind == OperationKind::OutputStreamNext
-          || operation.kind == OperationKind::OutputStreamCancel
-        {
-          state.output_streams.insert(*id);
-          state.cancelled_output_streams.remove(id);
-        } else {
-          state.objects.insert(*id);
+    if let Some(ReceiverBinding::Resource(resource)) = operation.receiver {
+      match resource.kind {
+        napi_family_core::ResourceKind::InputStream => {
+          if let Some(OhosValue::InputStream(id)) = args.first() {
+            state.input_streams.insert(*id);
+          }
+        }
+        napi_family_core::ResourceKind::Object | napi_family_core::ResourceKind::OutputStream => {
+          if let Some(OhosValue::Object(id) | OhosValue::OutputStream(id)) = args.first() {
+            if operation.kind == OperationKind::OutputStreamNext
+              || operation.kind == OperationKind::OutputStreamCancel
+            {
+              state.output_streams.insert(*id);
+              state.cancelled_output_streams.remove(id);
+            } else {
+              state.objects.insert(*id);
+            }
+          }
         }
       }
     }

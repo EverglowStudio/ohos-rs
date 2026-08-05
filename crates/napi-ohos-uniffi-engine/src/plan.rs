@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use napi_family_core::{
-  FamilyOperation, FamilyOperationTarget, FamilyPlan, ResourceKind, ResourceOwnership,
-  StreamDirection, ValuePathSegment,
+  FamilyOperation, FamilyOperationTarget, FamilyPlan, ReceiverBinding, ResourceKind,
+  ResourceOwnership, StreamDirection, ValuePathSegment,
 };
 use proc_macro2::Ident;
 use syn::{Path, Type};
@@ -262,22 +262,20 @@ fn validate_resource_hooks(
   hooks: &OhosResourceHooks,
 ) -> Result<(), OhosEngineError> {
   let needs_object = family.operations().iter().any(|operation| {
-    operation
-      .receiver
-      .as_ref()
-      .is_some_and(|receiver| receiver.kind == ResourceKind::Object)
-      || operation
-        .result
-        .is_some_and(|result| result.kind == ResourceKind::Object)
+    matches!(
+      operation.receiver,
+      Some(ReceiverBinding::Resource(resource)) if resource.kind == ResourceKind::Object
+    ) || operation
+      .result
+      .is_some_and(|result| result.kind == ResourceKind::Object)
   });
   let needs_output = family.operations().iter().any(|operation| {
-    operation
-      .receiver
-      .as_ref()
-      .is_some_and(|receiver| receiver.kind == ResourceKind::OutputStream)
-      || operation
-        .result
-        .is_some_and(|result| result.kind == ResourceKind::OutputStream)
+    matches!(
+      operation.receiver,
+      Some(ReceiverBinding::Resource(resource)) if resource.kind == ResourceKind::OutputStream
+    ) || operation
+      .result
+      .is_some_and(|result| result.kind == ResourceKind::OutputStream)
       || operation
         .streams
         .iter()
@@ -330,7 +328,24 @@ fn validate_receiver(
 ) -> Result<(), OhosEngineError> {
   match (family.receiver.as_ref(), &operation.receiver) {
     (None, None) => Ok(()),
-    (Some(expected), Some(actual)) => {
+    (Some(ReceiverBinding::Value), Some(actual)) => {
+      let valid = matches!(
+        &actual.binding,
+        OhosArgumentBinding::Direct { .. }
+          | OhosArgumentBinding::I64BigInt
+          | OhosArgumentBinding::U64BigInt
+          | OhosArgumentBinding::LowerWith { .. }
+          | OhosArgumentBinding::LowerWithHost { .. }
+      );
+      if valid {
+        Ok(())
+      } else {
+        Err(OhosEngineError::InvalidValueReceiver {
+          operation_id: operation.operation_id,
+        })
+      }
+    }
+    (Some(ReceiverBinding::Resource(expected)), Some(actual)) => {
       let valid = match (expected.kind, &actual.binding) {
         (ResourceKind::Object, OhosArgumentBinding::ObjectLease { ownership, .. })
         | (ResourceKind::OutputStream, OhosArgumentBinding::OutputStreamLease { ownership, .. }) => {
@@ -342,15 +357,15 @@ fn validate_receiver(
       if valid {
         Ok(())
       } else {
-        Err(OhosEngineError::InvalidObjectReceiver {
+        Err(OhosEngineError::InvalidResourceReceiver {
           operation_id: operation.operation_id,
         })
       }
     }
-    (Some(_), None) => Err(OhosEngineError::MissingObjectReceiver {
+    (Some(_), None) => Err(OhosEngineError::MissingReceiver {
       operation_id: operation.operation_id,
     }),
-    (None, Some(_)) => Err(OhosEngineError::UnexpectedObjectReceiver {
+    (None, Some(_)) => Err(OhosEngineError::UnexpectedReceiver {
       operation_id: operation.operation_id,
     }),
   }
@@ -407,8 +422,8 @@ fn validate_structured_bindings(
     let nested_callback = callback_paths
       .iter()
       .any(|use_site| use_site.path.segments().len() > 1);
-    let callback_proxy = matches!(argument.binding, OhosArgumentBinding::CallbackProxy { .. });
-    let lower_with_host = matches!(argument.binding, OhosArgumentBinding::LowerWithHost { .. });
+    let callback_proxy = matches!(&argument.binding, OhosArgumentBinding::CallbackProxy { .. });
+    let lower_with_host = matches!(&argument.binding, OhosArgumentBinding::LowerWithHost { .. });
     if direct_callback != callback_proxy {
       return Err(OhosEngineError::InvalidStructuredBinding {
         operation_id: operation.operation_id,

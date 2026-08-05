@@ -21,7 +21,7 @@ fn direct_argument(value: &str, ty: syn::Type) -> OhosArgumentPlan {
 }
 
 fn family() -> FamilyPlan {
-  let mut operations = Vec::with_capacity(21);
+  let mut operations = Vec::with_capacity(28);
   push_operation(&mut operations, 0, OperationKind::Function, AsyncKind::Sync, false, 1, OperationDispatch::Native);
   push_operation(&mut operations, 1, OperationKind::Function, AsyncKind::Async, false, 1, OperationDispatch::Native);
   let i64_op = operation(2, OperationKind::Function, AsyncKind::Sync, false, 1, OperationDispatch::Native);
@@ -66,11 +66,11 @@ fn family() -> FamilyPlan {
   });
   operations.push(output_start);
   let mut output_next = operation(13, OperationKind::OutputStreamNext, AsyncKind::Async, false, 0, OperationDispatch::Native);
-  output_next.receiver = Some(ResourceBinding { kind: ResourceKind::OutputStream, ownership: ResourceOwnership::Borrowed });
+  output_next.receiver = Some(ReceiverBinding::Resource(ResourceBinding { kind: ResourceKind::OutputStream, ownership: ResourceOwnership::Borrowed }));
   output_next.stream_slot = Some(StreamSlotIdentity { use_site_id: 1, operation_id: 13, kind: OperationKind::OutputStreamNext });
   operations.push(output_next);
   let mut output_cancel = operation(14, OperationKind::OutputStreamCancel, AsyncKind::Async, false, 0, OperationDispatch::Native);
-  output_cancel.receiver = Some(ResourceBinding { kind: ResourceKind::OutputStream, ownership: ResourceOwnership::Borrowed });
+  output_cancel.receiver = Some(ReceiverBinding::Resource(ResourceBinding { kind: ResourceKind::OutputStream, ownership: ResourceOwnership::Borrowed }));
   output_cancel.stream_slot = Some(StreamSlotIdentity { use_site_id: 1, operation_id: 14, kind: OperationKind::OutputStreamCancel });
   operations.push(output_cancel);
   let mut input = operation(15, OperationKind::Function, AsyncKind::Async, false, 1, OperationDispatch::Native);
@@ -89,11 +89,11 @@ fn family() -> FamilyPlan {
   });
   operations.push(input);
   let mut input_pull = operation(16, OperationKind::InputStreamPull, AsyncKind::Async, false, 0, OperationDispatch::InputStreamHostPull);
-  input_pull.receiver = Some(ResourceBinding { kind: ResourceKind::InputStream, ownership: ResourceOwnership::Borrowed });
+  input_pull.receiver = Some(ReceiverBinding::Resource(ResourceBinding { kind: ResourceKind::InputStream, ownership: ResourceOwnership::Borrowed }));
   input_pull.stream_slot = Some(StreamSlotIdentity { use_site_id: 0, operation_id: 16, kind: OperationKind::InputStreamPull });
   operations.push(input_pull);
   let mut input_cancel = operation(17, OperationKind::InputStreamCancel, AsyncKind::Async, false, 0, OperationDispatch::InputStreamHostCancel);
-  input_cancel.receiver = Some(ResourceBinding { kind: ResourceKind::InputStream, ownership: ResourceOwnership::Borrowed });
+  input_cancel.receiver = Some(ReceiverBinding::Resource(ResourceBinding { kind: ResourceKind::InputStream, ownership: ResourceOwnership::Borrowed }));
   input_cancel.stream_slot = Some(StreamSlotIdentity { use_site_id: 0, operation_id: 17, kind: OperationKind::InputStreamCancel });
   operations.push(input_cancel);
   push_operation(&mut operations, 18, OperationKind::Function, AsyncKind::Sync, false, 0, OperationDispatch::Native);
@@ -101,7 +101,26 @@ fn family() -> FamilyPlan {
   held_callback.callbacks.push(callback_site(19, CallbackThreading::CallingThread));
   operations.push(held_callback);
   push_operation(&mut operations, 20, OperationKind::Function, AsyncKind::Sync, false, 0, OperationDispatch::Native);
-  FamilyPlan::build(FamilyPlanInput { flavor: HostFlavor::Ohos, operations }).expect("valid generated fixture family plan")
+  let mut record_sync = operation(21, OperationKind::Method, AsyncKind::Sync, false, 0, OperationDispatch::Native);
+  record_sync.receiver = Some(ReceiverBinding::Value);
+  operations.push(record_sync);
+  let mut record_async = operation(22, OperationKind::Method, AsyncKind::Async, false, 0, OperationDispatch::Native);
+  record_async.receiver = Some(ReceiverBinding::Value);
+  operations.push(record_async);
+  let mut enum_sync = operation(23, OperationKind::Method, AsyncKind::Sync, false, 0, OperationDispatch::Native);
+  enum_sync.receiver = Some(ReceiverBinding::Value);
+  operations.push(enum_sync);
+  let mut enum_async = operation(24, OperationKind::Method, AsyncKind::Async, false, 0, OperationDispatch::Native);
+  enum_async.receiver = Some(ReceiverBinding::Value);
+  operations.push(enum_async);
+  push_operation(&mut operations, 25, OperationKind::Function, AsyncKind::Async, false, 0, OperationDispatch::Native);
+  push_operation(&mut operations, 26, OperationKind::Function, AsyncKind::Sync, false, 0, OperationDispatch::Native);
+  push_operation(&mut operations, 27, OperationKind::Function, AsyncKind::Sync, false, 0, OperationDispatch::Native);
+  FamilyPlan::build(FamilyPlanInput {
+    flavor: HostFlavor::Ohos,
+    close_policy: ClosePolicy { grace_ms: 40, on_deadline: DeadlineAction::Detach },
+    operations,
+  }).expect("valid generated fixture family plan")
 }
 
 fn push_operation(
@@ -177,6 +196,13 @@ fn operation_plans(family: &FamilyPlan) -> OhosBridgePlan {
       native(18, syn::parse_quote!(crate::generated_fixture::release_count), Vec::new(), OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(u32) }, OhosErrorBinding::Infallible),
       native(19, syn::parse_quote!(crate::generated_fixture::hold_sync_observer), vec![OhosArgumentPlan { name: name("observer"), binding: OhosArgumentBinding::CallbackProxy { rust_type: syn::parse_quote!(crate::generated_fixture::SyncObserverProxy), build: syn::parse_quote!(crate::generated_fixture::build_sync_observer) } }], OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(u32) }, OhosErrorBinding::Infallible),
       native(20, syn::parse_quote!(crate::generated_fixture::drop_held_sync_observers), Vec::new(), OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(u32) }, OhosErrorBinding::Infallible),
+      value_method(21, false, "record", "lower_value_record", "value_record_sync"),
+      value_method(22, true, "record", "lower_value_record", "value_record_async"),
+      value_method(23, false, "value", "lower_value_enum", "value_enum_sync"),
+      value_method(24, true, "value", "lower_value_enum", "value_enum_async"),
+      native(25, syn::parse_quote!(crate::generated_fixture::never_settle_native), Vec::new(), OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(u32) }, OhosErrorBinding::Infallible),
+      native(26, syn::parse_quote!(crate::generated_fixture::wake_output_cancel), Vec::new(), OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(u32) }, OhosErrorBinding::Infallible),
+      native(27, syn::parse_quote!(crate::generated_fixture::wake_never_settle_native), Vec::new(), OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(u32) }, OhosErrorBinding::Infallible),
     ],
     OhosResourceHooks {
       release_object: Some(OhosResourceHook { call: syn::parse_quote!(crate::generated_fixture::release_object), carrier_type: syn::parse_quote!(u32) }),
@@ -184,6 +210,29 @@ fn operation_plans(family: &FamilyPlan) -> OhosBridgePlan {
       release_output_stream: Some(OhosResourceHook { call: syn::parse_quote!(crate::generated_fixture::release_output_stream), carrier_type: syn::parse_quote!(u32) }),
     },
   ).expect("structured OHOS Rust bridge plan is valid")
+}
+
+fn value_method(
+  id: u32,
+  _asynchronous: bool,
+  argument_name: &str,
+  lower: &str,
+  call: &str,
+) -> OhosOperationPlan {
+  OhosOperationPlan {
+    operation_id: id,
+    target: OhosOperationTarget::Native { call: syn::parse_str(&format!("crate::generated_fixture::{call}")).unwrap() },
+    receiver: Some(OhosReceiverPlan {
+      name: name(argument_name),
+      binding: OhosArgumentBinding::LowerWith {
+        carrier_type: syn::parse_quote!(napi_ohos::bindgen_prelude::Object<'static>),
+        lower: syn::parse_str(&format!("crate::generated_fixture::{lower}")).unwrap(),
+      },
+    }),
+    arguments: Vec::new(),
+    return_binding: OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(u32) },
+    error_binding: OhosErrorBinding::Infallible,
+  }
 }
 
 fn main() {

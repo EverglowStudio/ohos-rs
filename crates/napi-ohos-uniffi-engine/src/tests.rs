@@ -2,9 +2,10 @@ use super::*;
 use futures::executor::block_on;
 use napi_family_core::{
   AsyncKind, CallbackContract, CallbackReentrancy, CallbackRetention, CallbackThreading,
-  CallbackUseSite, CarrierKind, ConversionRecipe, FamilyOperationInput, FamilyPlanInput,
-  HostFlavor, OperationDispatch, OperationKind, ResourceBinding, ResourceKind, ResourceOwnership,
-  StreamDirection, StreamSlotIdentity, StreamUseSite, StreamValueBinding, ValuePath,
+  CallbackUseSite, CarrierKind, ClosePolicy, ConversionRecipe, DeadlineAction,
+  FamilyOperationInput, FamilyPlanInput, HostFlavor, OperationDispatch, OperationKind,
+  ReceiverBinding, ResourceBinding, ResourceKind, ResourceOwnership, StreamDirection,
+  StreamSlotIdentity, StreamUseSite, StreamValueBinding, ValuePath,
 };
 use proc_macro2::{Ident, Span};
 use std::sync::{Arc, Mutex};
@@ -57,6 +58,10 @@ fn host(id: u32, target: OhosOperationTarget) -> OhosOperationPlan {
 fn family(operations: Vec<FamilyOperationInput>) -> FamilyPlan {
   FamilyPlan::build(FamilyPlanInput {
     flavor: HostFlavor::Ohos,
+    close_policy: ClosePolicy {
+      grace_ms: 5_000,
+      on_deadline: DeadlineAction::Detach,
+    },
     operations,
   })
   .unwrap()
@@ -295,10 +300,10 @@ fn callback_family() -> FamilyPlan {
     operation
   };
   let mut input = input;
-  input.receiver = Some(ResourceBinding {
+  input.receiver = Some(ReceiverBinding::Resource(ResourceBinding {
     kind: ResourceKind::InputStream,
     ownership: ResourceOwnership::Borrowed,
-  });
+  }));
   input.stream_slot = Some(StreamSlotIdentity {
     use_site_id: 0,
     operation_id: 2,
@@ -312,10 +317,10 @@ fn callback_family() -> FamilyPlan {
     0,
     OperationDispatch::InputStreamHostCancel,
   );
-  cancel.receiver = Some(ResourceBinding {
+  cancel.receiver = Some(ReceiverBinding::Resource(ResourceBinding {
     kind: ResourceKind::InputStream,
     ownership: ResourceOwnership::Borrowed,
-  });
+  }));
   cancel.stream_slot = Some(StreamSlotIdentity {
     use_site_id: 0,
     operation_id: 3,

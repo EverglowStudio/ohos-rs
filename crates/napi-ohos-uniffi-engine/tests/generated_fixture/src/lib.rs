@@ -4,9 +4,11 @@
 mod generated_fixture {
 use std::cell::RefCell;
 use std::ffi::CString;
-  use std::ptr;
-  use std::sync::atomic::{AtomicU32, Ordering};
-  use std::sync::Arc;
+use std::future::poll_fn;
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Poll, Waker};
 
   use napi_ohos::bindgen_prelude::{
     FnArgs, FromNapiValue, Function, JsObjectValue, JsValue, Object, Promise, ToNapiValue,
@@ -19,6 +21,18 @@ use std::ffi::CString;
   };
 
   static RELEASE_COUNT: AtomicU32 = AtomicU32::new(0);
+  static NATIVE_NEVER_READY: AtomicBool = AtomicBool::new(false);
+  static NATIVE_NEVER_WAKER: OnceLock<Mutex<Option<Waker>>> = OnceLock::new();
+  static OUTPUT_CANCEL_READY: AtomicBool = AtomicBool::new(false);
+  static OUTPUT_CANCEL_WAKER: OnceLock<Mutex<Option<Waker>>> = OnceLock::new();
+
+  fn native_never_waker() -> &'static Mutex<Option<Waker>> {
+    NATIVE_NEVER_WAKER.get_or_init(|| Mutex::new(None))
+  }
+
+  fn output_cancel_waker() -> &'static Mutex<Option<Waker>> {
+    OUTPUT_CANCEL_WAKER.get_or_init(|| Mutex::new(None))
+  }
 
   thread_local! {
     // Keep one native callback proxy alive across an operation boundary so
@@ -33,6 +47,33 @@ use std::ffi::CString;
 
   pub async fn async_echo(value: u32) -> u32 {
     value + 1
+  }
+
+  pub async fn never_settle_native() -> u32 {
+    poll_fn(|context| {
+      if NATIVE_NEVER_READY.load(Ordering::Acquire) {
+        Poll::Ready(0)
+      } else {
+        native_never_waker()
+          .lock()
+          .expect("native never-settle waker mutex poisoned")
+          .replace(context.waker().clone());
+        Poll::Pending
+      }
+    })
+    .await
+  }
+
+  pub fn wake_never_settle_native() -> u32 {
+    NATIVE_NEVER_READY.store(true, Ordering::Release);
+    if let Some(waker) = native_never_waker()
+      .lock()
+      .expect("native never-settle waker mutex poisoned")
+      .take()
+    {
+      waker.wake();
+    }
+    0
   }
 
   pub fn echo_i64(value: i64) -> i64 {
@@ -75,6 +116,52 @@ use std::ffi::CString;
 
   pub fn lift_thing(value: Object<'static>) -> Result<Object<'static>, BridgeErrorDescriptor> {
     Ok(value)
+  }
+
+  #[derive(Clone, Copy)]
+  pub struct ValueRecord {
+    pub handle: u32,
+  }
+
+  pub fn lower_value_record(value: Object<'static>) -> Result<ValueRecord, BridgeErrorDescriptor> {
+    value
+      .get_named_property::<u32>("handle")
+      .map(|handle| ValueRecord { handle })
+      .map_err(|error| BridgeErrorDescriptor::validation(error.to_string()))
+  }
+
+  pub fn value_record_sync(value: ValueRecord) -> u32 {
+    value.handle
+  }
+
+  pub async fn value_record_async(value: ValueRecord) -> u32 {
+    value.handle + 1
+  }
+
+  #[derive(Clone, Copy)]
+  pub struct ValueEnum {
+    pub handle: u32,
+  }
+
+  pub fn lower_value_enum(value: Object<'static>) -> Result<ValueEnum, BridgeErrorDescriptor> {
+    let tag = value
+      .get_named_property::<String>("tag")
+      .map_err(|error| BridgeErrorDescriptor::validation(error.to_string()))?;
+    if tag != "ready" {
+      return Err(BridgeErrorDescriptor::validation("unexpected enum tag"));
+    }
+    value
+      .get_named_property::<u32>("handle")
+      .map(|handle| ValueEnum { handle })
+      .map_err(|error| BridgeErrorDescriptor::validation(error.to_string()))
+  }
+
+  pub fn value_enum_sync(value: ValueEnum) -> u32 {
+    value.handle
+  }
+
+  pub async fn value_enum_async(value: ValueEnum) -> u32 {
+    value.handle + 1
   }
 
   pub struct SyncObserverProxy {
@@ -303,6 +390,20 @@ use std::ffi::CString;
   }
 
   pub async fn cancel_output_stream(_handle: u32) -> Result<(), BridgeErrorDescriptor> {
+    if _handle == 777 {
+      poll_fn(|context| {
+        if OUTPUT_CANCEL_READY.load(Ordering::Acquire) {
+          Poll::Ready(())
+        } else {
+          output_cancel_waker()
+            .lock()
+            .expect("output cancel waker mutex poisoned")
+            .replace(context.waker().clone());
+          Poll::Pending
+        }
+      })
+      .await;
+    }
     RELEASE_COUNT.fetch_add(10, Ordering::AcqRel);
     Ok(())
   }
@@ -310,6 +411,18 @@ use std::ffi::CString;
   pub fn release_output_stream(_handle: u32) -> Result<(), BridgeErrorDescriptor> {
     RELEASE_COUNT.fetch_add(100, Ordering::AcqRel);
     Ok(())
+  }
+
+  pub fn wake_output_cancel() -> u32 {
+    OUTPUT_CANCEL_READY.store(true, Ordering::Release);
+    if let Some(waker) = output_cancel_waker()
+      .lock()
+      .expect("output cancel waker mutex poisoned")
+      .take()
+    {
+      waker.wake();
+    }
+    0
   }
 
   include!(concat!(env!("OUT_DIR"), "/generated_ohos_module.rs"));

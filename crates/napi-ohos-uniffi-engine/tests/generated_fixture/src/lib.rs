@@ -28,6 +28,12 @@ use std::task::{Poll, Waker};
   static OUTPUT_CANCEL_WAKER: OnceLock<Mutex<Option<Waker>>> = OnceLock::new();
   static NESTED_LATE_READY: AtomicBool = AtomicBool::new(false);
   static NESTED_LATE_WAKER: OnceLock<Mutex<Option<Waker>>> = OnceLock::new();
+  static STREAM_ENV: OnceLock<usize> = OnceLock::new();
+  static STREAM_ITEM_STEPS: OnceLock<Mutex<Vec<SendObjectRef>>> = OnceLock::new();
+  static STREAM_ERROR_STEPS: OnceLock<Mutex<Vec<SendObjectRef>>> = OnceLock::new();
+  static STREAM_LATE_ITEM_STEPS: OnceLock<Mutex<Vec<SendObjectRef>>> = OnceLock::new();
+  static STREAM_STEP_LATE_READY: AtomicBool = AtomicBool::new(false);
+  static STREAM_STEP_LATE_WAKER: OnceLock<Mutex<Option<Waker>>> = OnceLock::new();
 
   fn native_never_waker() -> &'static Mutex<Option<Waker>> {
     NATIVE_NEVER_WAKER.get_or_init(|| Mutex::new(None))
@@ -39,6 +45,10 @@ use std::task::{Poll, Waker};
 
   fn nested_late_waker() -> &'static Mutex<Option<Waker>> {
     NESTED_LATE_WAKER.get_or_init(|| Mutex::new(None))
+  }
+
+  fn stream_step_late_waker() -> &'static Mutex<Option<Waker>> {
+    STREAM_STEP_LATE_WAKER.get_or_init(|| Mutex::new(None))
   }
 
   thread_local! {
@@ -387,6 +397,16 @@ use std::task::{Poll, Waker};
         "unexpected stream factory contract",
       ));
     }
+    STREAM_ENV.get_or_init(|| host.value().env as usize);
+    STREAM_ITEM_STEPS.get_or_init(|| {
+      Mutex::new(vec![make_stream_step("item", "value", 1001)])
+    });
+    STREAM_ERROR_STEPS.get_or_init(|| {
+      Mutex::new(vec![make_stream_step("error", "error", 1002)])
+    });
+    STREAM_LATE_ITEM_STEPS.get_or_init(|| {
+      Mutex::new(vec![make_stream_step("item", "value", 3001)])
+    });
     Ok(StreamFactoryProxy(*host))
   }
 
@@ -404,6 +424,76 @@ use std::task::{Poll, Waker};
 
   pub async fn next_stream(handle: u32) -> Option<u32> {
     Some(handle + 1)
+  }
+
+  fn stream_step_env() -> Env {
+    Env::from(
+      *STREAM_ENV
+        .get()
+        .expect("stream factory must initialize the N-API environment") as sys::napi_env,
+    )
+  }
+
+  fn make_stream_step(kind: &str, payload_name: &str, handle: u32) -> SendObjectRef {
+    let env = stream_step_env();
+    let mut step = Object::new(&env).expect("create stream step");
+    let mut payload = Object::new(&env).expect("create stream step resource");
+    payload
+      .set_named_property("handle", handle)
+      .expect("set stream step resource handle");
+    step
+      .set_named_property("kind", kind)
+      .expect("set stream step kind");
+    step
+      .set_named_property(payload_name, payload)
+      .expect("set stream step resource");
+    unsafe { SendObjectRef::from_napi_value(env.raw(), step.raw()).expect("retain stream step") }
+  }
+
+  fn take_stream_step(steps: &OnceLock<Mutex<Vec<SendObjectRef>>>) -> SendObjectRef {
+    steps
+      .get()
+      .expect("stream factory must initialize stream step resources")
+      .lock()
+      .expect("stream step resource mutex poisoned")
+      .pop()
+      .expect("generated stream fixture exhausted prebuilt stream steps")
+  }
+
+  pub async fn next_stream_object_item(_handle: u32) -> SendObjectRef {
+    take_stream_step(&STREAM_ITEM_STEPS)
+  }
+
+  pub async fn next_stream_object_error(_handle: u32) -> SendObjectRef {
+    take_stream_step(&STREAM_ERROR_STEPS)
+  }
+
+  pub async fn late_stream_object_item(_handle: u32) -> SendObjectRef {
+    poll_fn(|context| {
+      if STREAM_STEP_LATE_READY.load(Ordering::Acquire) {
+        Poll::Ready(())
+      } else {
+        stream_step_late_waker()
+          .lock()
+          .expect("stream step late waker mutex poisoned")
+          .replace(context.waker().clone());
+        Poll::Pending
+      }
+    })
+    .await;
+    take_stream_step(&STREAM_LATE_ITEM_STEPS)
+  }
+
+  pub fn wake_stream_step_late() -> u32 {
+    STREAM_STEP_LATE_READY.store(true, Ordering::Release);
+    if let Some(waker) = stream_step_late_waker()
+      .lock()
+      .expect("stream step late waker mutex poisoned")
+      .take()
+    {
+      waker.wake();
+    }
+    0
   }
 
   pub fn lift_optional_u32(value: Option<u32>) -> Result<Option<u32>, BridgeErrorDescriptor> {

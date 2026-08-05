@@ -21,7 +21,7 @@ fn direct_argument(value: &str, ty: syn::Type) -> OhosArgumentPlan {
 }
 
 fn family() -> FamilyPlan {
-  let mut operations = Vec::with_capacity(33);
+  let mut operations = Vec::with_capacity(37);
   push_operation(&mut operations, 0, OperationKind::Function, AsyncKind::Sync, false, 1, OperationDispatch::Native);
   push_operation(&mut operations, 1, OperationKind::Function, AsyncKind::Async, false, 1, OperationDispatch::Native);
   let i64_op = operation(2, OperationKind::Function, AsyncKind::Sync, false, 1, OperationDispatch::Native);
@@ -137,6 +137,21 @@ fn family() -> FamilyPlan {
   late_nested_object.result_resources = mixed_late_resources(31);
   operations.push(late_nested_object);
   push_operation(&mut operations, 32, OperationKind::Function, AsyncKind::Sync, false, 0, OperationDispatch::Native);
+  for (id, path_segment) in [
+    (33, ValuePathSegment::StreamItem),
+    (34, ValuePathSegment::StreamError),
+    (35, ValuePathSegment::StreamItem),
+  ] {
+    let mut stream_step = operation(id, OperationKind::OutputStreamNext, AsyncKind::Async, false, 0, OperationDispatch::Native);
+    stream_step.receiver = Some(ReceiverBinding::Resource(ResourceBinding { kind: ResourceKind::OutputStream, ownership: ResourceOwnership::Borrowed }));
+    stream_step.result_resources.push(ResultResourceUseSite {
+      operation_id: id,
+      path: ValuePath::new(vec![ValuePathSegment::Return, path_segment]),
+      binding: ResourceBinding { kind: ResourceKind::Object, ownership: ResourceOwnership::Owned },
+    });
+    operations.push(stream_step);
+  }
+  push_operation(&mut operations, 36, OperationKind::Function, AsyncKind::Sync, false, 0, OperationDispatch::Native);
   FamilyPlan::build(FamilyPlanInput {
     flavor: HostFlavor::Ohos,
     close_policy: ClosePolicy { grace_ms: 40, on_deadline: DeadlineAction::Detach },
@@ -311,6 +326,10 @@ fn operation_plans(family: &FamilyPlan) -> OhosBridgePlan {
       native(30, syn::parse_quote!(crate::generated_fixture::nested_input), vec![direct_argument("value", syn::parse_quote!(napi_ohos::bindgen_prelude::Object<'static>))], OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(napi_ohos::bindgen_prelude::Object<'static>) }, OhosErrorBinding::Infallible),
       native(31, syn::parse_quote!(crate::generated_fixture::nested_late_object), vec![direct_argument("value", syn::parse_quote!(crate::generated_fixture::SendObjectRef))], OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(crate::generated_fixture::SendObjectRef) }, OhosErrorBinding::Infallible),
       native(32, syn::parse_quote!(crate::generated_fixture::wake_nested_late), Vec::new(), OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(u32) }, OhosErrorBinding::Infallible),
+      stream_step(33, syn::parse_quote!(crate::generated_fixture::next_stream_object_item), syn::parse_quote!(crate::generated_fixture::SendObjectRef)),
+      stream_step(34, syn::parse_quote!(crate::generated_fixture::next_stream_object_error), syn::parse_quote!(crate::generated_fixture::SendObjectRef)),
+      stream_step(35, syn::parse_quote!(crate::generated_fixture::late_stream_object_item), syn::parse_quote!(crate::generated_fixture::SendObjectRef)),
+      native(36, syn::parse_quote!(crate::generated_fixture::wake_stream_step_late), Vec::new(), OhosReturnBinding::Direct { carrier_type: syn::parse_quote!(u32) }, OhosErrorBinding::Infallible),
     ],
     OhosResourceHooks {
       release_object: Some(OhosResourceHook { call: syn::parse_quote!(crate::generated_fixture::release_object), carrier_type: syn::parse_quote!(u32) }),
@@ -318,6 +337,24 @@ fn operation_plans(family: &FamilyPlan) -> OhosBridgePlan {
       release_output_stream: Some(OhosResourceHook { call: syn::parse_quote!(crate::generated_fixture::release_output_stream), carrier_type: syn::parse_quote!(u32) }),
     },
   ).expect("structured OHOS Rust bridge plan is valid")
+}
+
+fn stream_step(id: u32, call: syn::Path, carrier_type: syn::Type) -> OhosOperationPlan {
+  OhosOperationPlan {
+    operation_id: id,
+    target: OhosOperationTarget::Native { call },
+    receiver: Some(OhosReceiverPlan {
+      name: name("stream"),
+      binding: OhosArgumentBinding::OutputStreamLease {
+        carrier_type: syn::parse_quote!(u32),
+        lower: syn::parse_quote!(crate::generated_fixture::lower_handle),
+        ownership: ResourceOwnership::Borrowed,
+      },
+    }),
+    arguments: Vec::new(),
+    return_binding: OhosReturnBinding::Direct { carrier_type },
+    error_binding: OhosErrorBinding::Infallible,
+  }
 }
 
 fn value_method(

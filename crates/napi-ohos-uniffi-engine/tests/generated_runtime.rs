@@ -270,6 +270,65 @@ const object = { handle: 77 };
   }
   assert.equal(session.invokeSync(18, []).value, 111);
 
+  // StreamStep owns resources inside the tagged output of OutputStreamNext.
+  // The generated OHOS path must preserve the exact own-key shape and route
+  // object release through the same session scheduler as ordinary results.
+  const stepLiveSession = addon.__uniffi_backend_factory(host);
+  const stepLiveOutput = stepLiveSession.invokeSync(12, [11]).value;
+  const stepLiveBefore = stepLiveSession.invokeSync(18, []).value;
+  const liveItemStep = (await stepLiveSession.invokeAsync(33, [stepLiveOutput])).value;
+  assert.deepEqual(Object.keys(liveItemStep).sort(), ['kind', 'value']);
+  assert.equal(liveItemStep.kind, 'item');
+  assert.equal(liveItemStep.value.handle, 1001);
+  stepLiveSession.releaseObject(liveItemStep.value);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stepLiveSession.invokeSync(18, []).value, stepLiveBefore + 1);
+  const stepLiveCloseTimers = timerSnapshot();
+  await stepLiveSession.close();
+  assertOneTeardownTimer(stepLiveCloseTimers, 'live StreamItem close');
+  const stepLiveCount = addon.__uniffi_backend_factory(host);
+  assert.equal(stepLiveCount.invokeSync(18, []).value, stepLiveBefore + 111);
+  await stepLiveCount.close();
+
+  const stepErrorSession = addon.__uniffi_backend_factory(host);
+  const stepErrorOutput = stepErrorSession.invokeSync(12, [11]).value;
+  const stepErrorBefore = stepErrorSession.invokeSync(18, []).value;
+  const errorStep = (await stepErrorSession.invokeAsync(34, [stepErrorOutput])).value;
+  assert.deepEqual(Object.keys(errorStep).sort(), ['error', 'kind']);
+  assert.equal(errorStep.kind, 'error');
+  assert.equal(errorStep.error.handle, 1002);
+  const stepErrorCloseTimers = timerSnapshot();
+  await stepErrorSession.close();
+  assertOneTeardownTimer(stepErrorCloseTimers, 'StreamError close');
+  const stepErrorCount = addon.__uniffi_backend_factory(host);
+  assert.equal(stepErrorCount.invokeSync(18, []).value, stepErrorBefore + 111);
+  await stepErrorCount.close();
+
+  // After the close deadline, the detached walker still follows StreamItem
+  // when the native future finally produces its object-bearing result.  The
+  // output receiver and the late object each release exactly once.
+  const lateStepController = addon.__uniffi_backend_factory(host);
+  const lateStepSession = addon.__uniffi_backend_factory(host);
+  const lateStepOutput = lateStepSession.invokeSync(12, [11]).value;
+  const lateStepBefore = lateStepSession.invokeSync(18, []).value;
+  const lateStepResult = lateStepSession.invokeAsync(35, [lateStepOutput]);
+  const lateStepTimers = timerSnapshot();
+  const lateStepClose = lateStepSession.close();
+  await new Promise((resolve) => originalSetTimeout(resolve, 80));
+  await lateStepClose;
+  assertOneTeardownTimer(lateStepTimers, 'late StreamItem close');
+  lateStepController.invokeSync(36, []);
+  const lateItemStep = (await lateStepResult).value;
+  assert.deepEqual(Object.keys(lateItemStep).sort(), ['kind', 'value']);
+  assert.equal(lateItemStep.kind, 'item');
+  assert.equal(lateItemStep.value.handle, 3001);
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => originalSetTimeout(resolve, 80));
+  const lateStepCount = addon.__uniffi_backend_factory(host);
+  assert.equal(lateStepCount.invokeSync(18, []).value, lateStepBefore + 111);
+  await lateStepCount.close();
+  await lateStepController.close();
+
   // A native consumer can keep a retained callback proxy after the call
   // returns.  Its lease must remain live until the consumer explicitly drops
   // that proxy, then release exactly once on the JS-thread scheduler.
@@ -319,7 +378,7 @@ const object = { handle: 77 };
   // close is idempotent after the first close has completed.
   await closeSession.close();
   const nextSession = addon.__uniffi_backend_factory(host);
-  assert.equal(nextSession.invokeSync(18, []).value, 222);
+  assert.equal(nextSession.invokeSync(18, []).value, 555);
   await nextSession.close();
 
   // The OHOS fixture carries an explicit short ClosePolicy.  A native future

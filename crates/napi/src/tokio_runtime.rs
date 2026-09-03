@@ -1,6 +1,6 @@
 #[cfg(not(feature = "noop"))]
 use std::sync::{LazyLock, OnceLock, RwLock};
-use std::{future::Future, marker::PhantomData};
+use std::{any::Any, future::Future, marker::PhantomData};
 
 use tokio::runtime::Runtime;
 
@@ -51,6 +51,17 @@ static USER_DEFINED_RT: OnceLock<RwLock<Option<Runtime>>> = OnceLock::new();
 
 #[cfg(not(feature = "noop"))]
 static IS_USER_DEFINED_RT: OnceLock<bool> = OnceLock::new();
+
+#[cfg(not(feature = "noop"))]
+fn panic_message(reason: &(dyn Any + Send)) -> &str {
+  if let Some(message) = reason.downcast_ref::<&str>() {
+    message
+  } else if let Some(message) = reason.downcast_ref::<String>() {
+    message.as_str()
+  } else {
+    "Panic in async function"
+  }
+}
 
 #[cfg(not(feature = "noop"))]
 /// Create a custom Tokio runtime used by the NAPI-RS.
@@ -229,14 +240,10 @@ pub fn execute_tokio_future<
   spawn(async move {
     if let Err(err) = jh.await {
       if let Ok(reason) = err.try_into_panic() {
-        if let Some(s) = reason.downcast_ref::<&str>() {
-          deferred_for_panic.reject(Error::new(crate::Status::GenericFailure, s));
-        } else {
-          deferred_for_panic.reject(Error::new(
-            crate::Status::GenericFailure,
-            "Panic in async function",
-          ));
-        }
+        deferred_for_panic.reject(Error::new(
+          crate::Status::GenericFailure,
+          panic_message(reason.as_ref()),
+        ));
       }
     }
   });
@@ -298,14 +305,10 @@ pub fn execute_tokio_future_with_finalize_callback<
   spawn(async move {
     if let Err(err) = jh.await {
       if let Ok(reason) = err.try_into_panic() {
-        if let Some(s) = reason.downcast_ref::<&str>() {
-          deferred_for_panic.reject(Error::new(crate::Status::GenericFailure, s));
-        } else {
-          deferred_for_panic.reject(Error::new(
-            crate::Status::GenericFailure,
-            "Panic in async function",
-          ));
-        }
+        deferred_for_panic.reject(Error::new(
+          crate::Status::GenericFailure,
+          panic_message(reason.as_ref()),
+        ));
       }
     }
   });
@@ -416,5 +419,21 @@ impl<T: ToNapiValue + 'static> ToNapiValue for AsyncBlock<T> {
     val: Self,
   ) -> Result<napi_sys_ohos::napi_value> {
     Ok(val.inner)
+  }
+}
+
+#[cfg(all(test, not(feature = "noop")))]
+mod tests {
+  use super::panic_message;
+
+  #[test]
+  fn panic_message_preserves_string_payloads() {
+    let borrowed: &'static str = "borrowed panic";
+    let owned = String::from("owned panic");
+    let opaque = 7_u8;
+
+    assert_eq!(panic_message(&borrowed), "borrowed panic");
+    assert_eq!(panic_message(&owned), "owned panic");
+    assert_eq!(panic_message(&opaque), "Panic in async function");
   }
 }
